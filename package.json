@@ -1,0 +1,28 @@
+{
+  "name": "kosku",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "start": "npm run start --workspace=@kosku/user-app",
+    "android": "npm run android --workspace=@kosku/user-app",
+    "ios": "npm run ios --workspace=@kosku/user-app",
+    "web": "npm run web --workspace=@kosku/user-app",
+    "typecheck": "npm run typecheck --workspace=@kosku/user-app",
+    "lint": "npm run lint --workspace=@kosku/user-app",
+    "test": "node --import tsx --test tests/*.test.mjs",
+    "check:supabase": "node scripts/check-supabase.mjs"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
+    "eslint": "^9.39.5",
+    "eslint-config-expo": "^57.0.2",
+    "tsx": "^4.23.15"
+  }
+}

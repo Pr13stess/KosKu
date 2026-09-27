@@ -1,0 +1,21 @@
+{
+  "expo": {
+    "name": "KosKu",
+    "slug": "kosku",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.kosku.demo.user"
+    },
+    "android": {
+      "package": "com.kosku.demo.user"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "scheme": "kosku"
+  }
+}
