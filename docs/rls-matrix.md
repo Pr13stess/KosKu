@@ -46,3 +46,10 @@ Helper `private.*` memakai fixed search_path dan identitas Auth. Helper definer 
 Seluruh view katalog memakai security_invoker; fungsi pencarian juga security invoker. Inventory mentah tetap privat, sehingga hitungan global memakai helper agregat dengan cakupan publik yang dibatasi.
 
 Pemeriksaan cakupan SQL: `supabase/tests/rls_coverage.sql`. Uji peran: `tests/database.test.mjs`.
+
+## Auth (migrasi `202609270004_auth.sql`)
+
+Hak tulis client tetap nol pada semua tabel. Dua tambahan sempit:
+
+- Trigger `on_auth_user_created` (security definer) membuat baris `profiles` dan role `USER` saat baris `auth.users` baru muncul, tanpa tulis dari client. Idempotent (`on conflict do nothing`), sehingga `seed.sql` tetap aman.
+- RPC `update_own_profile(full_name, phone, campus_or_company)` (security definer, hanya `authenticated`) hanya mengubah baris milik `auth.uid()`; anon ditolak. Kolom `status`/`deleted_at` tidak bisa disentuh client.

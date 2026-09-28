@@ -260,6 +260,65 @@ test("Migrations, seed, RLS isolation, aggregates and integrity", async (t) => {
         );
       },
     );
+    await t.test(
+      "Signing up provisions a profile and USER role without a client write, and a user can only edit their own profile via RPC",
+      async () => {
+        await as("postgres");
+        await db.exec(
+          `insert into auth.users(id,email) values ('${id(7000)}','newuser@kosku.invalid')`,
+        );
+        assert.deepEqual(
+          (
+            await rows(
+              `select full_name,phone from public.profiles where id='${id(7000)}'`,
+            )
+          )[0],
+          { full_name: null, phone: null },
+        );
+        assert.equal(
+          (
+            await rows(
+              `select role from public.user_roles where user_id='${id(7000)}'`,
+            )
+          )[0].role,
+          "USER",
+        );
+        // Re-inserting the same auth.users row's downstream effects must stay
+        // idempotent (mirrors what seed.sql now relies on).
+        await db.exec(
+          `insert into public.profiles(id) values ('${id(7000)}') on conflict (id) do nothing;
+           insert into public.user_roles(user_id,role) values ('${id(7000)}','USER') on conflict (user_id, role) do nothing;`,
+        );
+        await as("anon");
+        await assert.rejects(
+          db.exec(`select public.update_own_profile('Should Fail')`),
+          /Not authenticated/,
+        );
+        await as("authenticated", id(7000));
+        await db.exec(
+          `select public.update_own_profile('New User','0800-DEMO')`,
+        );
+        assert.deepEqual(
+          (
+            await rows(
+              `select full_name,phone from public.profiles where id='${id(7000)}'`,
+            )
+          )[0],
+          { full_name: "New User", phone: "0800-DEMO" },
+        );
+        await as("authenticated", id(3));
+        await db.exec(`select public.update_own_profile('Attacker')`);
+        await as("postgres");
+        assert.equal(
+          (
+            await rows(
+              `select full_name from public.profiles where id='${id(7000)}'`,
+            )
+          )[0].full_name,
+          "New User",
+        );
+      },
+    );
   } finally {
     await db.close();
   }

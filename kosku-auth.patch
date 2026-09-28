@@ -1,0 +1,1136 @@
+diff --git a/apps/user-app/package.json b/apps/user-app/package.json
+index 5b666d3..0b372f3 100644
+--- a/apps/user-app/package.json
++++ b/apps/user-app/package.json
+@@ -4,6 +4,7 @@
+   "main": "index.ts",
+   "dependencies": {
+     "@expo/metro-runtime": "~57.0.16",
++    "@react-native-async-storage/async-storage": "~2.2.0",
+     "@react-navigation/native": "^7.4.1",
+     "@react-navigation/native-stack": "^7.19.2",
+     "@supabase/supabase-js": "^2.117.2",
+diff --git a/apps/user-app/src/data/mock/MockAuthRepository.ts b/apps/user-app/src/data/mock/MockAuthRepository.ts
+new file mode 100644
+index 0000000..1d26df5
+--- /dev/null
++++ b/apps/user-app/src/data/mock/MockAuthRepository.ts
+@@ -0,0 +1,49 @@
++import type { AuthRepository } from "../../domain/repositories/AuthRepository";
++import type { Session } from "../../domain/models";
++type Listener = (session: Session | null) => void;
++/**
++ * In-memory only: matches the rest of the mock/* layer, which never
++ * persists across app restarts. Lets the app work end-to-end with no
++ * .env, mirroring how MockPropertyRepository stands in for Supabase.
++ */
++export class MockAuthRepository implements AuthRepository {
++  private session: Session | null = null;
++  private readonly listeners = new Set<Listener>();
++  private readonly users = new Map<string, { id: string; password: string }>();
++  private emit() {
++    for (const listener of this.listeners) listener(this.session);
++  }
++  async getSession() {
++    return this.session;
++  }
++  onChange(callback: Listener) {
++    this.listeners.add(callback);
++    callback(this.session);
++    return () => {
++      this.listeners.delete(callback);
++    };
++  }
++  async signUp(email: string, password: string) {
++    const key = email.trim().toLowerCase();
++    if (!key || !password) throw new Error("Email dan kata sandi wajib diisi.");
++    if (password.length < 6)
++      throw new Error("Kata sandi minimal 6 karakter.");
++    if (this.users.has(key)) throw new Error("Email sudah terdaftar.");
++    const id = `mock-${key}`;
++    this.users.set(key, { id, password });
++    this.session = { user: { id, email: key } };
++    this.emit();
++  }
++  async signIn(email: string, password: string) {
++    const key = email.trim().toLowerCase();
++    const record = this.users.get(key);
++    if (!record || record.password !== password)
++      throw new Error("Email atau kata sandi salah.");
++    this.session = { user: { id: record.id, email: key } };
++    this.emit();
++  }
++  async signOut() {
++    this.session = null;
++    this.emit();
++  }
++}
+diff --git a/apps/user-app/src/data/supabase/SupabaseAuthRepository.ts b/apps/user-app/src/data/supabase/SupabaseAuthRepository.ts
+new file mode 100644
+index 0000000..b4b7549
+--- /dev/null
++++ b/apps/user-app/src/data/supabase/SupabaseAuthRepository.ts
+@@ -0,0 +1,39 @@
++import type {
++  Session as SupabaseSession,
++  SupabaseClient,
++} from "@supabase/supabase-js";
++import type { AuthRepository } from "../../domain/repositories/AuthRepository";
++import type { Session } from "../../domain/models";
++function toSession(session: SupabaseSession | null): Session | null {
++  if (!session?.user) return null;
++  return { user: { id: session.user.id, email: session.user.email ?? null } };
++}
++export class SupabaseAuthRepository implements AuthRepository {
++  constructor(private readonly client: SupabaseClient) {}
++  async getSession() {
++    const { data, error } = await this.client.auth.getSession();
++    if (error) throw new Error(error.message);
++    return toSession(data.session);
++  }
++  onChange(callback: (session: Session | null) => void) {
++    const { data } = this.client.auth.onAuthStateChange((_event, session) => {
++      callback(toSession(session));
++    });
++    return () => data.subscription.unsubscribe();
++  }
++  async signUp(email: string, password: string) {
++    const { error } = await this.client.auth.signUp({ email, password });
++    if (error) throw new Error(error.message);
++  }
++  async signIn(email: string, password: string) {
++    const { error } = await this.client.auth.signInWithPassword({
++      email,
++      password,
++    });
++    if (error) throw new Error(error.message);
++  }
++  async signOut() {
++    const { error } = await this.client.auth.signOut();
++    if (error) throw new Error(error.message);
++  }
++}
+diff --git a/apps/user-app/src/domain/models.ts b/apps/user-app/src/domain/models.ts
+index 63d108b..41b9afa 100644
+--- a/apps/user-app/src/domain/models.ts
++++ b/apps/user-app/src/domain/models.ts
+@@ -67,6 +67,13 @@ export interface SearchQuery {
+   sort: "recommended" | "price" | "rating" | "nearest";
+   page: number;
+ }
++export interface AuthUser {
++  id: string;
++  email: string | null;
++}
++export interface Session {
++  user: AuthUser;
++}
+ export const defaultQuery: SearchQuery = {
+   text: "",
+   durationUnit: "MONTH",
+diff --git a/apps/user-app/src/domain/repositories/AuthRepository.ts b/apps/user-app/src/domain/repositories/AuthRepository.ts
+new file mode 100644
+index 0000000..2749efe
+--- /dev/null
++++ b/apps/user-app/src/domain/repositories/AuthRepository.ts
+@@ -0,0 +1,8 @@
++import type { Session } from "../models";
++export interface AuthRepository {
++  getSession(): Promise<Session | null>;
++  onChange(callback: (session: Session | null) => void): () => void;
++  signUp(email: string, password: string): Promise<void>;
++  signIn(email: string, password: string): Promise<void>;
++  signOut(): Promise<void>;
++}
+diff --git a/apps/user-app/src/navigation/RootNavigator.tsx b/apps/user-app/src/navigation/RootNavigator.tsx
+index 54d3aea..932a6e8 100644
+--- a/apps/user-app/src/navigation/RootNavigator.tsx
++++ b/apps/user-app/src/navigation/RootNavigator.tsx
+@@ -1,13 +1,25 @@
++import { ActivityIndicator, View } from "react-native";
+ import { NavigationContainer } from "@react-navigation/native";
+ import { createNativeStackNavigator } from "@react-navigation/native-stack";
+ import type { RootStackParamList } from "./types";
++import { useAuthSession } from "../presentation/hooks/useAuthSession";
++import { LoginScreen } from "../presentation/screens/LoginScreen";
++import { RegisterScreen } from "../presentation/screens/RegisterScreen";
+ import { HomeScreen } from "../presentation/screens/HomeScreen";
+ import { PropertyDetailScreen } from "../presentation/screens/PropertyDetailScreen";
+ import { RoomSelectionScreen } from "../presentation/screens/RoomSelectionScreen";
+ import { PlanSelectionScreen } from "../presentation/screens/PlanSelectionScreen";
+ import { colors } from "../presentation/theme";
+ const Stack = createNativeStackNavigator<RootStackParamList>();
++function LoadingScreen() {
++  return (
++    <View style={{ flex: 1, alignItems: "center", justifyContent: "center" }}>
++      <ActivityIndicator color={colors.primary} />
++    </View>
++  );
++}
+ export function RootNavigator() {
++  const { loading, session } = useAuthSession();
+   return (
+     <NavigationContainer>
+       <Stack.Navigator
+@@ -19,26 +31,49 @@ export function RootNavigator() {
+           contentStyle: { backgroundColor: "#fff" },
+         }}
+       >
+-        <Stack.Screen
+-          name="Home"
+-          component={HomeScreen}
+-          options={{ headerShown: false }}
+-        />
+-        <Stack.Screen
+-          name="PropertyDetail"
+-          component={PropertyDetailScreen}
+-          options={{ title: "Detail kos" }}
+-        />
+-        <Stack.Screen
+-          name="RoomSelection"
+-          component={RoomSelectionScreen}
+-          options={{ title: "Pilih tipe kamar" }}
+-        />
+-        <Stack.Screen
+-          name="PlanSelection"
+-          component={PlanSelectionScreen}
+-          options={{ title: "Pilih paket sewa" }}
+-        />
++        {loading ? (
++          <Stack.Screen
++            name="Login"
++            options={{ headerShown: false }}
++            component={LoadingScreen}
++          />
++        ) : !session ? (
++          <>
++            <Stack.Screen
++              name="Login"
++              component={LoginScreen}
++              options={{ headerShown: false }}
++            />
++            <Stack.Screen
++              name="Register"
++              component={RegisterScreen}
++              options={{ headerShown: false }}
++            />
++          </>
++        ) : (
++          <>
++            <Stack.Screen
++              name="Home"
++              component={HomeScreen}
++              options={{ headerShown: false }}
++            />
++            <Stack.Screen
++              name="PropertyDetail"
++              component={PropertyDetailScreen}
++              options={{ title: "Detail kos" }}
++            />
++            <Stack.Screen
++              name="RoomSelection"
++              component={RoomSelectionScreen}
++              options={{ title: "Pilih tipe kamar" }}
++            />
++            <Stack.Screen
++              name="PlanSelection"
++              component={PlanSelectionScreen}
++              options={{ title: "Pilih paket sewa" }}
++            />
++          </>
++        )}
+       </Stack.Navigator>
+     </NavigationContainer>
+   );
+diff --git a/apps/user-app/src/navigation/types.ts b/apps/user-app/src/navigation/types.ts
+index 06a7aa7..ad86d45 100644
+--- a/apps/user-app/src/navigation/types.ts
++++ b/apps/user-app/src/navigation/types.ts
+@@ -1,5 +1,7 @@
+ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
+ export type RootStackParamList = {
++  Login: undefined;
++  Register: undefined;
+   Home: undefined;
+   PropertyDetail: { propertyId: string };
+   RoomSelection: { propertyId: string };
+diff --git a/apps/user-app/src/presentation/hooks/useAuthSession.ts b/apps/user-app/src/presentation/hooks/useAuthSession.ts
+new file mode 100644
+index 0000000..c59e322
+--- /dev/null
++++ b/apps/user-app/src/presentation/hooks/useAuthSession.ts
+@@ -0,0 +1,28 @@
++import { useEffect, useState } from "react";
++import { useRepositories } from "../../providers/RepositoryProvider";
++import type { Session } from "../../domain/models";
++/**
++ * Resolves once (getSession) then stays live via onChange, so the
++ * navigator can gate the app behind a session without polling.
++ */
++export function useAuthSession() {
++  const { auth } = useRepositories();
++  const [state, setState] = useState<{
++    loading: boolean;
++    session: Session | null;
++  }>({ loading: true, session: null });
++  useEffect(() => {
++    let active = true;
++    auth.getSession().then((session) => {
++      if (active) setState({ loading: false, session });
++    });
++    const unsubscribe = auth.onChange((session) => {
++      if (active) setState({ loading: false, session });
++    });
++    return () => {
++      active = false;
++      unsubscribe();
++    };
++  }, [auth]);
++  return state;
++}
+diff --git a/apps/user-app/src/presentation/screens/HomeScreen.tsx b/apps/user-app/src/presentation/screens/HomeScreen.tsx
+index 313385b..929b026 100644
+--- a/apps/user-app/src/presentation/screens/HomeScreen.tsx
++++ b/apps/user-app/src/presentation/screens/HomeScreen.tsx
+@@ -12,6 +12,7 @@ import { defaultQuery } from "../../domain/models";
+ import { useRepositories } from "../../providers/RepositoryProvider";
+ import type { ScreenProps } from "../../navigation/types";
+ import { useResource } from "../hooks/useResource";
++import { useAuthSession } from "../hooks/useAuthSession";
+ import { colors } from "../theme";
+ import { PropertyCard } from "../components/PropertyCard";
+ import { Status, Button } from "../components/Primitives";
+@@ -19,10 +20,13 @@ import { FilterSheet } from "../components/FilterSheet";
+ import { LocationSheet } from "../components/LocationSheet";
+ import { Sheet } from "../components/Sheet";
+ export function HomeScreen({ navigation }: ScreenProps<"Home">) {
+-  const { properties, mode } = useRepositories();
++  const { properties, auth, mode } = useRepositories();
++  const { session } = useAuthSession();
+   const [query, setQuery] = useState(defaultQuery),
+     [text, setText] = useState(""),
+-    [sheet, setSheet] = useState<"filter" | "location" | "future" | null>(null);
++    [sheet, setSheet] = useState<
++      "filter" | "location" | "future" | "profile" | null
++    >(null);
+   const loader = useCallback(
+     () => properties.search(query),
+     [properties, query],
+@@ -179,7 +183,10 @@ export function HomeScreen({ navigation }: ScreenProps<"Home">) {
+               key={item.label}
+               accessibilityRole="button"
+               accessibilityLabel={item.label}
+-              onPress={() => (i === 0 ? undefined : setSheet("future"))}
++              onPress={() => {
++                if (i === 0) return;
++                setSheet(i === 3 ? "profile" : "future");
++              }}
+               style={styles.dockItem}
+             >
+               <View style={[styles.dockIcon, i === 0 && styles.dockActive]}>
+@@ -226,6 +233,23 @@ export function HomeScreen({ navigation }: ScreenProps<"Home">) {
+             }}
+           />
+         )}
++        <Sheet
++          visible={sheet === "profile"}
++          title="Akun"
++          onClose={() => setSheet(null)}
++        >
++          <Text style={styles.future}>
++            Masuk sebagai {session?.user.email ?? "-"}.
++          </Text>
++          <Button
++            title="Keluar"
++            onPress={() => {
++              setSheet(null);
++              auth.signOut();
++            }}
++            secondary
++          />
++        </Sheet>
+         <Sheet
+           visible={sheet === "future"}
+           title="Segera hadir"
+diff --git a/apps/user-app/src/presentation/screens/LoginScreen.tsx b/apps/user-app/src/presentation/screens/LoginScreen.tsx
+new file mode 100644
+index 0000000..9a3fc28
+--- /dev/null
++++ b/apps/user-app/src/presentation/screens/LoginScreen.tsx
+@@ -0,0 +1,115 @@
++import { useState } from "react";
++import {
++  KeyboardAvoidingView,
++  Platform,
++  StyleSheet,
++  Text,
++  TextInput,
++  View,
++} from "react-native";
++import { SafeAreaView } from "react-native-safe-area-context";
++import type { ScreenProps } from "../../navigation/types";
++import { useRepositories } from "../../providers/RepositoryProvider";
++import { Button } from "../components/Primitives";
++import { colors } from "../theme";
++export function LoginScreen({ navigation }: ScreenProps<"Login">) {
++  const { auth, mode } = useRepositories();
++  const [email, setEmail] = useState("");
++  const [password, setPassword] = useState("");
++  const [error, setError] = useState<string | null>(null);
++  const [submitting, setSubmitting] = useState(false);
++  const submit = async () => {
++    setError(null);
++    setSubmitting(true);
++    try {
++      await auth.signIn(email, password);
++      // No navigation.navigate() here: RootNavigator swaps stacks the
++      // moment useAuthSession picks up the new session.
++    } catch (e) {
++      setError(e instanceof Error ? e.message : "Gagal masuk.");
++    } finally {
++      setSubmitting(false);
++    }
++  };
++  return (
++    <SafeAreaView style={styles.safe}>
++      <KeyboardAvoidingView
++        behavior={Platform.OS === "ios" ? "padding" : undefined}
++        style={styles.flex}
++      >
++        <View style={styles.container}>
++          <Text style={styles.title}>Masuk ke KosKu</Text>
++          <Text style={styles.subtitle}>
++            {mode === "mock"
++              ? "Mode demo: daftar akun baru dulu jika belum punya, data tidak tersimpan permanen."
++              : "Gunakan email dan kata sandi akunmu."}
++          </Text>
++          <View style={styles.field}>
++            <Text style={styles.label}>Email</Text>
++            <TextInput
++              style={styles.input}
++              value={email}
++              onChangeText={setEmail}
++              autoCapitalize="none"
++              autoComplete="email"
++              keyboardType="email-address"
++              placeholder="nama@email.com"
++              placeholderTextColor={colors.muted}
++            />
++          </View>
++          <View style={styles.field}>
++            <Text style={styles.label}>Kata sandi</Text>
++            <TextInput
++              style={styles.input}
++              value={password}
++              onChangeText={setPassword}
++              secureTextEntry
++              autoComplete="password"
++              placeholder="••••••••"
++              placeholderTextColor={colors.muted}
++            />
++          </View>
++          {error && <Text style={styles.error}>{error}</Text>}
++          <Button
++            title={submitting ? "Memproses…" : "Masuk"}
++            onPress={submit}
++            disabled={submitting || !email || !password}
++          />
++          <Button
++            title="Belum punya akun? Daftar"
++            onPress={() => navigation.navigate("Register")}
++            secondary
++          />
++        </View>
++      </KeyboardAvoidingView>
++    </SafeAreaView>
++  );
++}
++const styles = StyleSheet.create({
++  safe: { flex: 1, backgroundColor: colors.background },
++  flex: { flex: 1 },
++  container: {
++    flex: 1,
++    justifyContent: "center",
++    padding: 24,
++    gap: 14,
++    width: "100%",
++    maxWidth: 420,
++    alignSelf: "center",
++  },
++  title: { fontSize: 22, fontWeight: "800", color: colors.ink },
++  subtitle: { fontSize: 12, color: colors.muted, marginBottom: 8 },
++  field: { gap: 6 },
++  label: { fontSize: 12, color: colors.muted, fontWeight: "600" },
++  input: {
++    borderWidth: 1,
++    borderColor: colors.line,
++    borderRadius: 10,
++    paddingHorizontal: 14,
++    paddingVertical: 12,
++    fontSize: 14,
++    color: colors.ink,
++    backgroundColor: colors.surface,
++  },
++  error: { fontSize: 12, color: colors.danger },
++});
+diff --git a/apps/user-app/src/presentation/screens/RegisterScreen.tsx b/apps/user-app/src/presentation/screens/RegisterScreen.tsx
+new file mode 100644
+index 0000000..073f993
+--- /dev/null
++++ b/apps/user-app/src/presentation/screens/RegisterScreen.tsx
+@@ -0,0 +1,139 @@
++import { useState } from "react";
++import {
++  KeyboardAvoidingView,
++  Platform,
++  StyleSheet,
++  Text,
++  TextInput,
++  View,
++} from "react-native";
++import { SafeAreaView } from "react-native-safe-area-context";
++import type { ScreenProps } from "../../navigation/types";
++import { useRepositories } from "../../providers/RepositoryProvider";
++import { Button } from "../components/Primitives";
++import { colors } from "../theme";
++export function RegisterScreen({ navigation }: ScreenProps<"Register">) {
++  const { auth, mode } = useRepositories();
++  const [email, setEmail] = useState("");
++  const [password, setPassword] = useState("");
++  const [confirm, setConfirm] = useState("");
++  const [error, setError] = useState<string | null>(null);
++  const [notice, setNotice] = useState<string | null>(null);
++  const [submitting, setSubmitting] = useState(false);
++  const submit = async () => {
++    setError(null);
++    setNotice(null);
++    if (password !== confirm) {
++      setError("Konfirmasi kata sandi tidak cocok.");
++      return;
++    }
++    setSubmitting(true);
++    try {
++      await auth.signUp(email, password);
++      if (mode === "supabase") {
++        // Supabase may require email confirmation depending on project
++        // settings; either way there is no session to react to yet.
++        setNotice(
++          "Pendaftaran berhasil. Periksa email untuk verifikasi, lalu masuk.",
++        );
++      }
++      // In mock mode, signUp already opens a session; RootNavigator
++      // swaps to the app stack on its own.
++    } catch (e) {
++      setError(e instanceof Error ? e.message : "Gagal mendaftar.");
++    } finally {
++      setSubmitting(false);
++    }
++  };
++  return (
++    <SafeAreaView style={styles.safe}>
++      <KeyboardAvoidingView
++        behavior={Platform.OS === "ios" ? "padding" : undefined}
++        style={styles.flex}
++      >
++        <View style={styles.container}>
++          <Text style={styles.title}>Buat akun KosKu</Text>
++          <Text style={styles.subtitle}>
++            Dipakai untuk menyimpan pilihan sewa dan riwayat booking.
++          </Text>
++          <View style={styles.field}>
++            <Text style={styles.label}>Email</Text>
++            <TextInput
++              style={styles.input}
++              value={email}
++              onChangeText={setEmail}
++              autoCapitalize="none"
++              autoComplete="email"
++              keyboardType="email-address"
++              placeholder="nama@email.com"
++              placeholderTextColor={colors.muted}
++            />
++          </View>
++          <View style={styles.field}>
++            <Text style={styles.label}>Kata sandi</Text>
++            <TextInput
++              style={styles.input}
++              value={password}
++              onChangeText={setPassword}
++              secureTextEntry
++              placeholder="Minimal 6 karakter"
++              placeholderTextColor={colors.muted}
++            />
++          </View>
++          <View style={styles.field}>
++            <Text style={styles.label}>Ulangi kata sandi</Text>
++            <TextInput
++              style={styles.input}
++              value={confirm}
++              onChangeText={setConfirm}
++              secureTextEntry
++              placeholder="••••••••"
++              placeholderTextColor={colors.muted}
++            />
++          </View>
++          {error && <Text style={styles.error}>{error}</Text>}
++          {notice && <Text style={styles.notice}>{notice}</Text>}
++          <Button
++            title={submitting ? "Memproses…" : "Daftar"}
++            onPress={submit}
++            disabled={submitting || !email || !password || !confirm}
++          />
++          <Button
++            title="Sudah punya akun? Masuk"
++            onPress={() => navigation.navigate("Login")}
++            secondary
++          />
++        </View>
++      </KeyboardAvoidingView>
++    </SafeAreaView>
++  );
++}
++const styles = StyleSheet.create({
++  safe: { flex: 1, backgroundColor: colors.background },
++  flex: { flex: 1 },
++  container: {
++    flex: 1,
++    justifyContent: "center",
++    padding: 24,
++    gap: 14,
++    width: "100%",
++    maxWidth: 420,
++    alignSelf: "center",
++  },
++  title: { fontSize: 22, fontWeight: "800", color: colors.ink },
++  subtitle: { fontSize: 12, color: colors.muted, marginBottom: 8 },
++  field: { gap: 6 },
++  label: { fontSize: 12, color: colors.muted, fontWeight: "600" },
++  input: {
++    borderWidth: 1,
++    borderColor: colors.line,
++    borderRadius: 10,
++    paddingHorizontal: 14,
++    paddingVertical: 12,
++    fontSize: 14,
++    color: colors.ink,
++    backgroundColor: colors.surface,
++  },
++  error: { fontSize: 12, color: colors.danger },
++  notice: { fontSize: 12, color: colors.green },
++});
+diff --git a/apps/user-app/src/providers/RepositoryProvider.tsx b/apps/user-app/src/providers/RepositoryProvider.tsx
+index ecc0883..fce428b 100644
+--- a/apps/user-app/src/providers/RepositoryProvider.tsx
++++ b/apps/user-app/src/providers/RepositoryProvider.tsx
+@@ -6,19 +6,24 @@ import {
+   type PropsWithChildren,
+ } from "react";
+ import { createClient } from "@supabase/supabase-js";
++import AsyncStorage from "@react-native-async-storage/async-storage";
+ import type { PropertyRepository } from "../domain/repositories/PropertyRepository";
+ import type { RoomRepository } from "../domain/repositories/RoomRepository";
+ import type { PricingRepository } from "../domain/repositories/PricingRepository";
++import type { AuthRepository } from "../domain/repositories/AuthRepository";
+ import { MockPropertyRepository } from "../data/mock/MockPropertyRepository";
+ import { MockRoomRepository } from "../data/mock/MockRoomRepository";
+ import { MockPricingRepository } from "../data/mock/MockPricingRepository";
++import { MockAuthRepository } from "../data/mock/MockAuthRepository";
+ import { SupabasePropertyRepository } from "../data/supabase/SupabasePropertyRepository";
+ import { SupabaseRoomRepository } from "../data/supabase/SupabaseRoomRepository";
+ import { SupabasePricingRepository } from "../data/supabase/SupabasePricingRepository";
++import { SupabaseAuthRepository } from "../data/supabase/SupabaseAuthRepository";
+ export interface Repositories {
+   properties: PropertyRepository;
+   rooms: RoomRepository;
+   pricing: PricingRepository;
++  auth: AuthRepository;
+   mode: "mock" | "supabase";
+ }
+ const Context = createContext<Repositories | null>(null);
+@@ -30,8 +35,9 @@ function compose(): Repositories {
+   if (url && key) {
+     const client = createClient(url, key, {
+       auth: {
+-        persistSession: false,
+-        autoRefreshToken: false,
++        storage: AsyncStorage,
++        persistSession: true,
++        autoRefreshToken: true,
+         detectSessionInUrl: false,
+       },
+     });
+@@ -39,6 +45,7 @@ function compose(): Repositories {
+       properties: new SupabasePropertyRepository(client),
+       rooms: new SupabaseRoomRepository(client),
+       pricing: new SupabasePricingRepository(client),
++      auth: new SupabaseAuthRepository(client),
+       mode: "supabase",
+     };
+   }
+@@ -46,6 +53,7 @@ function compose(): Repositories {
+     properties: new MockPropertyRepository(),
+     rooms: new MockRoomRepository(),
+     pricing: new MockPricingRepository(),
++    auth: new MockAuthRepository(),
+     mode: "mock",
+   };
+ }
+diff --git a/docs/rls-matrix.md b/docs/rls-matrix.md
+index 63d3a9b..3b91b93 100644
+--- a/docs/rls-matrix.md
++++ b/docs/rls-matrix.md
+@@ -46,3 +46,10 @@ Helper `private.*` memakai fixed search_path dan identitas Auth. Helper definer
+ Seluruh view katalog memakai security_invoker; fungsi pencarian juga security invoker. Inventory mentah tetap privat, sehingga hitungan global memakai helper agregat dengan cakupan publik yang dibatasi.
+ 
+ Pemeriksaan cakupan SQL: `supabase/tests/rls_coverage.sql`. Uji peran: `tests/database.test.mjs`.
++
++## Auth (migrasi `202609270004_auth.sql`)
++
++Hak tulis client tetap nol pada semua tabel. Dua tambahan sempit:
++
++- Trigger `on_auth_user_created` (security definer) membuat baris `profiles` dan role `USER` saat baris `auth.users` baru muncul, tanpa tulis dari client. Idempotent (`on conflict do nothing`), sehingga `seed.sql` tetap aman.
++- RPC `update_own_profile(full_name, phone, campus_or_company)` (security definer, hanya `authenticated`) hanya mengubah baris milik `auth.uid()`; anon ditolak. Kolom `status`/`deleted_at` tidak bisa disentuh client.
+diff --git a/package-lock.json b/package-lock.json
+index 9fef199..ab3a405 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -26,6 +26,7 @@
+       "version": "1.0.0",
+       "dependencies": {
+         "@expo/metro-runtime": "~57.0.16",
++        "@react-native-async-storage/async-storage": "~2.2.0",
+         "@react-navigation/native": "^7.4.1",
+         "@react-navigation/native-stack": "^7.19.2",
+         "@supabase/supabase-js": "^2.117.2",
+@@ -2542,6 +2543,18 @@
+         "node": ">=12.4.0"
+       }
+     },
++    "node_modules/@react-native-async-storage/async-storage": {
++      "version": "2.2.0",
++      "resolved": "https://registry.npmjs.org/@react-native-async-storage/async-storage/-/async-storage-2.2.0.tgz",
++      "integrity": "sha512-gvRvjR5JAaUZF8tv2Kcq/Gbt3JHwbKFYfmb445rhOj6NUMx3qPLixmDx5pZAyb9at1bYvJ4/eTUipU5aki45xw==",
++      "license": "MIT",
++      "dependencies": {
++        "merge-options": "^3.0.4"
++      },
++      "peerDependencies": {
++        "react-native": "^0.0.0-0 || >=0.65 <1.0"
++      }
++    },
+     "node_modules/@react-native/assets-registry": {
+       "version": "0.86.3",
+       "resolved": "https://registry.npmjs.org/@react-native/assets-registry/-/assets-registry-0.86.3.tgz",
+@@ -3374,9 +3387,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -3391,9 +3401,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -3408,9 +3415,6 @@
+         "loong64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -3425,9 +3429,6 @@
+         "loong64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -3442,9 +3443,6 @@
+         "ppc64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -3459,9 +3457,6 @@
+         "riscv64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -3476,9 +3471,6 @@
+         "riscv64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -3493,9 +3485,6 @@
+         "s390x"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -3510,9 +3499,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -3527,9 +3513,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -7036,6 +7019,15 @@
+         "url": "https://github.com/sponsors/ljharb"
+       }
+     },
++    "node_modules/is-plain-obj": {
++      "version": "2.1.0",
++      "resolved": "https://registry.npmjs.org/is-plain-obj/-/is-plain-obj-2.1.0.tgz",
++      "integrity": "sha512-YWnfyRwxL/+SsrWYfOpUtz5b3YD+nyfkHvjbcanzk8zgyO4ASD67uVMRt8k5bM4lLMDnXfriRhOpemw+NfT1eA==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=8"
++      }
++    },
+     "node_modules/is-regex": {
+       "version": "1.2.1",
+       "resolved": "https://registry.npmjs.org/is-regex/-/is-regex-1.2.1.tgz",
+@@ -7622,9 +7614,6 @@
+       "cpu": [
+         "arm64"
+       ],
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+@@ -7645,9 +7634,6 @@
+       "cpu": [
+         "arm64"
+       ],
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+@@ -7668,9 +7654,6 @@
+       "cpu": [
+         "x64"
+       ],
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+@@ -7691,9 +7674,6 @@
+       "cpu": [
+         "x64"
+       ],
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+@@ -7917,6 +7897,18 @@
+       "integrity": "sha512-zYiwtZUcYyXKo/np96AGZAckk+FWWsUdJ3cHGGmld7+AhvcWmQyGCYUh1hc4Q/pkOhb65dQR/pqCyK0cOaHz4Q==",
+       "license": "MIT"
+     },
++    "node_modules/merge-options": {
++      "version": "3.0.4",
++      "resolved": "https://registry.npmjs.org/merge-options/-/merge-options-3.0.4.tgz",
++      "integrity": "sha512-2Sug1+knBjkaMsMgf1ctR1Ujx+Ayku4EdJN4Z+C2+JzoeF7A3OZ9KM2GY0CpQS51NR61LTurMJrRKPhSs3ZRTQ==",
++      "license": "MIT",
++      "dependencies": {
++        "is-plain-obj": "^2.1.0"
++      },
++      "engines": {
++        "node": ">=10"
++      }
++    },
+     "node_modules/merge-stream": {
+       "version": "2.0.0",
+       "resolved": "https://registry.npmjs.org/merge-stream/-/merge-stream-2.0.0.tgz",
+diff --git a/supabase/migrations/202609270004_auth.sql b/supabase/migrations/202609270004_auth.sql
+new file mode 100644
+index 0000000..9e5b619
+--- /dev/null
++++ b/supabase/migrations/202609270004_auth.sql
+@@ -0,0 +1,60 @@
++-- ============================================================
++-- 22. AUTH PROVISIONING
++--
++-- First commit shipped Auth as an identity source only
++-- (auth.users / auth.uid()) with no signup UI and no client
++-- write grants. This migration adds the minimum needed for a
++-- real signup/login flow without widening write access beyond
++-- a user's own row:
++--   1. A trigger that provisions profiles/user_roles rows the
++--      moment a new auth.users row appears, so every signed-up
++--      user has a matching profile without a client-side write.
++--   2. A narrow security-definer RPC that lets a signed-in user
++--      edit their own display fields, instead of granting a
++--      blanket UPDATE policy on public.profiles.
++-- ============================================================
++create function public.handle_new_user()
++returns trigger
++language plpgsql
++security definer
++set search_path=''
++as $$
++begin
++  insert into public.profiles(id)
++  values (new.id)
++  on conflict (id) do nothing;
++  insert into public.user_roles(user_id, role)
++  values (new.id, 'USER')
++  on conflict (user_id, role) do nothing;
++  return new;
++end;
++$$;
++create trigger on_auth_user_created
++after insert on auth.users
++for each row
++execute function public.handle_new_user();
++
++create function public.update_own_profile(
++  p_full_name varchar(120) default null,
++  p_phone varchar(30) default null,
++  p_campus_or_company varchar(150) default null
++)
++returns void
++language plpgsql
++security definer
++set search_path=''
++as $$
++begin
++  if auth.uid() is null then
++    raise exception 'Not authenticated';
++  end if;
++  update public.profiles
++  set
++    full_name = coalesce(p_full_name, full_name),
++    phone = coalesce(p_phone, phone),
++    campus_or_company = coalesce(p_campus_or_company, campus_or_company)
++  where id = auth.uid();
++end;
++$$;
++grant execute on function public.update_own_profile(varchar, varchar, varchar)
++to authenticated;
+diff --git a/supabase/seed.sql b/supabase/seed.sql
+index af2da7e..011bffe 100644
+--- a/supabase/seed.sql
++++ b/supabase/seed.sql
+@@ -1,23 +1,23 @@
+ -- DEMO ONLY. Run after migrations in a fresh development Supabase project.
+ begin;
+ insert into auth.users(id,email) values ('00000000-0000-4000-8000-000000000001','demo1@kosku.invalid');
+-insert into public.profiles (id,full_name,phone) values ('00000000-0000-4000-8000-000000000001','Ratna Demo','PRIVATE-DEMO');
+-insert into public.user_roles (user_id,role) values ('00000000-0000-4000-8000-000000000001','USER');
++insert into public.profiles (id,full_name,phone) values ('00000000-0000-4000-8000-000000000001','Ratna Demo','PRIVATE-DEMO') on conflict (id) do update set full_name=excluded.full_name, phone=excluded.phone;
++insert into public.user_roles (user_id,role) values ('00000000-0000-4000-8000-000000000001','USER') on conflict (user_id, role) do nothing;
+ insert into auth.users(id,email) values ('00000000-0000-4000-8000-000000000002','demo2@kosku.invalid');
+-insert into public.profiles (id,full_name,phone) values ('00000000-0000-4000-8000-000000000002','Owner Belum Terverifikasi','PRIVATE-DEMO');
+-insert into public.user_roles (user_id,role) values ('00000000-0000-4000-8000-000000000002','USER');
++insert into public.profiles (id,full_name,phone) values ('00000000-0000-4000-8000-000000000002','Owner Belum Terverifikasi','PRIVATE-DEMO') on conflict (id) do update set full_name=excluded.full_name, phone=excluded.phone;
++insert into public.user_roles (user_id,role) values ('00000000-0000-4000-8000-000000000002','USER') on conflict (user_id, role) do nothing;
+ insert into auth.users(id,email) values ('00000000-0000-4000-8000-000000000003','demo3@kosku.invalid');
+-insert into public.profiles (id,full_name,phone) values ('00000000-0000-4000-8000-000000000003','User Satu','PRIVATE-DEMO');
+-insert into public.user_roles (user_id,role) values ('00000000-0000-4000-8000-000000000003','USER');
++insert into public.profiles (id,full_name,phone) values ('00000000-0000-4000-8000-000000000003','User Satu','PRIVATE-DEMO') on conflict (id) do update set full_name=excluded.full_name, phone=excluded.phone;
++insert into public.user_roles (user_id,role) values ('00000000-0000-4000-8000-000000000003','USER') on conflict (user_id, role) do nothing;
+ insert into auth.users(id,email) values ('00000000-0000-4000-8000-000000000004','demo4@kosku.invalid');
+-insert into public.profiles (id,full_name,phone) values ('00000000-0000-4000-8000-000000000004','User Dua','PRIVATE-DEMO');
+-insert into public.user_roles (user_id,role) values ('00000000-0000-4000-8000-000000000004','USER');
++insert into public.profiles (id,full_name,phone) values ('00000000-0000-4000-8000-000000000004','User Dua','PRIVATE-DEMO') on conflict (id) do update set full_name=excluded.full_name, phone=excluded.phone;
++insert into public.user_roles (user_id,role) values ('00000000-0000-4000-8000-000000000004','USER') on conflict (user_id, role) do nothing;
+ insert into auth.users(id,email) values ('00000000-0000-4000-8000-000000000005','demo5@kosku.invalid');
+-insert into public.profiles (id,full_name,phone) values ('00000000-0000-4000-8000-000000000005','Admin Demo','PRIVATE-DEMO');
+-insert into public.user_roles (user_id,role) values ('00000000-0000-4000-8000-000000000005','ADMIN');
+-insert into public.user_roles (user_id,role) values ('00000000-0000-4000-8000-000000000001','OWNER');
++insert into public.profiles (id,full_name,phone) values ('00000000-0000-4000-8000-000000000005','Admin Demo','PRIVATE-DEMO') on conflict (id) do update set full_name=excluded.full_name, phone=excluded.phone;
++insert into public.user_roles (user_id,role) values ('00000000-0000-4000-8000-000000000005','ADMIN') on conflict (user_id, role) do nothing;
++insert into public.user_roles (user_id,role) values ('00000000-0000-4000-8000-000000000001','OWNER') on conflict (user_id, role) do nothing;
+ insert into public.owner_profiles (user_id,display_name,verification_status) values ('00000000-0000-4000-8000-000000000001','Ibu Ratna · Owner Demo','APPROVED');
+-insert into public.user_roles (user_id,role) values ('00000000-0000-4000-8000-000000000002','OWNER');
++insert into public.user_roles (user_id,role) values ('00000000-0000-4000-8000-000000000002','OWNER') on conflict (user_id, role) do nothing;
+ insert into public.owner_profiles (user_id,display_name,verification_status) values ('00000000-0000-4000-8000-000000000002','Owner Pending','PENDING');
+ insert into public.facilities (id,name,category) values ('00000000-0000-4000-8000-000000003000','Wi-Fi','PROPERTY');
+ insert into public.facilities (id,name,category) values ('00000000-0000-4000-8000-000000003001','Dapur bersama','PROPERTY');
+diff --git a/tests/auth.test.mjs b/tests/auth.test.mjs
+new file mode 100644
+index 0000000..fd5545a
+--- /dev/null
++++ b/tests/auth.test.mjs
+@@ -0,0 +1,56 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { createClient } from "@supabase/supabase-js";
++import { MockAuthRepository } from "../apps/user-app/src/data/mock/MockAuthRepository.ts";
++import { SupabaseAuthRepository } from "../apps/user-app/src/data/supabase/SupabaseAuthRepository.ts";
++
++test("Mock auth: signup opens a session, wrong password is rejected, signout clears it", async () => {
++  const auth = new MockAuthRepository();
++  const seen = [];
++  const off = auth.onChange((s) => seen.push(s?.user.email ?? null));
++  await assert.rejects(auth.signUp("a@b.co", "123"), /minimal 6/);
++  await auth.signUp("A@b.co", "secret1");
++  assert.equal((await auth.getSession()).user.email, "a@b.co");
++  await assert.rejects(auth.signUp("a@b.co", "secret1"), /sudah terdaftar/);
++  await auth.signOut();
++  assert.equal(await auth.getSession(), null);
++  await assert.rejects(auth.signIn("a@b.co", "salah"), /salah/);
++  await auth.signIn("a@b.co", "secret1");
++  assert.equal((await auth.getSession()).user.email, "a@b.co");
++  off();
++  assert.deepEqual(seen, [null, "a@b.co", null, "a@b.co"]);
++});
++
++test("Supabase auth adapter uses real SDK requests and maps errors", async () => {
++  const calls = [];
++  const fetch = async (input, options) => {
++    const url = new URL(String(input));
++    calls.push({ url, body: options?.body ? JSON.parse(options.body) : null });
++    if (url.pathname.endsWith("/token")) {
++      const body = JSON.parse(options.body);
++      if (body.password !== "benar123")
++        return new Response(
++          JSON.stringify({ error_description: "Invalid login credentials", error: "invalid_grant" }),
++          { status: 400, headers: { "Content-Type": "application/json" } },
++        );
++      return new Response(
++        JSON.stringify({
++          access_token: "a", token_type: "bearer", expires_in: 3600, refresh_token: "r",
++          user: { id: "00000000-0000-4000-8000-000000000009", email: "u@kosku.invalid", aud: "authenticated", app_metadata: {}, user_metadata: {}, created_at: "2026-01-01T00:00:00Z" },
++        }),
++        { status: 200, headers: { "Content-Type": "application/json" } },
++      );
++    }
++    throw new Error("Unexpected API request");
++  };
++  const client = createClient("https://fixture.invalid", "test-public-key", {
++    global: { fetch },
++    auth: { persistSession: false, autoRefreshToken: false },
++  });
++  const auth = new SupabaseAuthRepository(client);
++  await assert.rejects(auth.signIn("u@kosku.invalid", "salah"), /Invalid login credentials/);
++  await auth.signIn("u@kosku.invalid", "benar123");
++  assert.equal(calls.at(-1).url.searchParams.get("grant_type"), "password");
++  assert.equal((await auth.getSession()).user.email, "u@kosku.invalid");
++  await auth.signOut().catch(() => {});
++});
+diff --git a/tests/database.test.mjs b/tests/database.test.mjs
+index 3b27f5e..9b5215c 100644
+--- a/tests/database.test.mjs
++++ b/tests/database.test.mjs
+@@ -260,6 +260,65 @@ test("Migrations, seed, RLS isolation, aggregates and integrity", async (t) => {
+         );
+       },
+     );
++    await t.test(
++      "Signing up provisions a profile and USER role without a client write, and a user can only edit their own profile via RPC",
++      async () => {
++        await as("postgres");
++        await db.exec(
++          `insert into auth.users(id,email) values ('${id(7000)}','newuser@kosku.invalid')`,
++        );
++        assert.deepEqual(
++          (
++            await rows(
++              `select full_name,phone from public.profiles where id='${id(7000)}'`,
++            )
++          )[0],
++          { full_name: null, phone: null },
++        );
++        assert.equal(
++          (
++            await rows(
++              `select role from public.user_roles where user_id='${id(7000)}'`,
++            )
++          )[0].role,
++          "USER",
++        );
++        // Re-inserting the same auth.users row's downstream effects must stay
++        // idempotent (mirrors what seed.sql now relies on).
++        await db.exec(
++          `insert into public.profiles(id) values ('${id(7000)}') on conflict (id) do nothing;
++           insert into public.user_roles(user_id,role) values ('${id(7000)}','USER') on conflict (user_id, role) do nothing;`,
++        );
++        await as("anon");
++        await assert.rejects(
++          db.exec(`select public.update_own_profile('Should Fail')`),
++          /Not authenticated/,
++        );
++        await as("authenticated", id(7000));
++        await db.exec(
++          `select public.update_own_profile('New User','0800-DEMO')`,
++        );
++        assert.deepEqual(
++          (
++            await rows(
++              `select full_name,phone from public.profiles where id='${id(7000)}'`,
++            )
++          )[0],
++          { full_name: "New User", phone: "0800-DEMO" },
++        );
++        await as("authenticated", id(3));
++        await db.exec(`select public.update_own_profile('Attacker')`);
++        await as("postgres");
++        assert.equal(
++          (
++            await rows(
++              `select full_name from public.profiles where id='${id(7000)}'`,
++            )
++          )[0].full_name,
++          "New User",
++        );
++      },
++    );
+   } finally {
+     await db.close();
+   }

@@ -12,6 +12,7 @@ import { defaultQuery } from "../../domain/models";
 import { useRepositories } from "../../providers/RepositoryProvider";
 import type { ScreenProps } from "../../navigation/types";
 import { useResource } from "../hooks/useResource";
+import { useAuthSession } from "../hooks/useAuthSession";
 import { colors } from "../theme";
 import { PropertyCard } from "../components/PropertyCard";
 import { Status, Button } from "../components/Primitives";
@@ -19,10 +20,13 @@ import { FilterSheet } from "../components/FilterSheet";
 import { LocationSheet } from "../components/LocationSheet";
 import { Sheet } from "../components/Sheet";
 export function HomeScreen({ navigation }: ScreenProps<"Home">) {
-  const { properties, mode } = useRepositories();
+  const { properties, auth, mode } = useRepositories();
+  const { session } = useAuthSession();
   const [query, setQuery] = useState(defaultQuery),
     [text, setText] = useState(""),
-    [sheet, setSheet] = useState<"filter" | "location" | "future" | null>(null);
+    [sheet, setSheet] = useState<
+      "filter" | "location" | "future" | "profile" | null
+    >(null);
   const loader = useCallback(
     () => properties.search(query),
     [properties, query],
@@ -179,7 +183,10 @@ export function HomeScreen({ navigation }: ScreenProps<"Home">) {
               key={item.label}
               accessibilityRole="button"
               accessibilityLabel={item.label}
-              onPress={() => (i === 0 ? undefined : setSheet("future"))}
+              onPress={() => {
+                if (i === 0) return;
+                setSheet(i === 3 ? "profile" : "future");
+              }}
               style={styles.dockItem}
             >
               <View style={[styles.dockIcon, i === 0 && styles.dockActive]}>
@@ -226,6 +233,23 @@ export function HomeScreen({ navigation }: ScreenProps<"Home">) {
             }}
           />
         )}
+        <Sheet
+          visible={sheet === "profile"}
+          title="Akun"
+          onClose={() => setSheet(null)}
+        >
+          <Text style={styles.future}>
+            Masuk sebagai {session?.user.email ?? "-"}.
+          </Text>
+          <Button
+            title="Keluar"
+            onPress={() => {
+              setSheet(null);
+              auth.signOut();
+            }}
+            secondary
+          />
+        </Sheet>
         <Sheet
           visible={sheet === "future"}
           title="Segera hadir"

@@ -67,6 +67,13 @@ export interface SearchQuery {
   sort: "recommended" | "price" | "rating" | "nearest";
   page: number;
 }
+export interface AuthUser {
+  id: string;
+  email: string | null;
+}
+export interface Session {
+  user: AuthUser;
+}
 export const defaultQuery: SearchQuery = {
   text: "",
   durationUnit: "MONTH",
