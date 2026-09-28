@@ -217,6 +217,7 @@ export function HomeScreen({ navigation }: ScreenProps<"Home">) {
         )}
         {sheet === "location" && (
           <LocationSheet
+            current={query.reference}
             onClose={() => setSheet(null)}
             onSelect={(reference) => {
               setQuery({

@@ -1,0 +1,530 @@
+diff --git a/apps/user-app/.env.example b/apps/user-app/.env.example
+index c57b7ca..db68783 100644
+--- a/apps/user-app/.env.example
++++ b/apps/user-app/.env.example
+@@ -2,3 +2,4 @@ EXPO_PUBLIC_SUPABASE_URL=
+ EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY=
+ # Legacy anon key is also accepted instead of publishable key:
+ EXPO_PUBLIC_SUPABASE_ANON_KEY=
++
+diff --git a/apps/user-app/app.json b/apps/user-app/app.json
+index faec679..dcad578 100644
+--- a/apps/user-app/app.json
++++ b/apps/user-app/app.json
+@@ -16,6 +16,14 @@
+     "web": {
+       "favicon": "./assets/favicon.png"
+     },
+-    "scheme": "kosku"
++    "scheme": "kosku",
++    "plugins": [
++      [
++        "expo-location",
++        {
++          "locationWhenInUsePermission": "KosKu memakai lokasimu hanya untuk menghitung jarak ke kos. Lokasi tidak disimpan."
++        }
++      ]
++    ]
+   }
+ }
+diff --git a/apps/user-app/package.json b/apps/user-app/package.json
+index 0b372f3..e383fb2 100644
+--- a/apps/user-app/package.json
++++ b/apps/user-app/package.json
+@@ -9,6 +9,7 @@
+     "@react-navigation/native-stack": "^7.19.2",
+     "@supabase/supabase-js": "^2.117.2",
+     "expo": "~57.0.25",
++    "expo-location": "~57.0.20",
+     "expo-status-bar": "~57.0.1",
+     "react": "19.2.3",
+     "react-dom": "19.2.3",
+@@ -16,7 +17,8 @@
+     "react-native-safe-area-context": "~5.7.0",
+     "react-native-screens": "~4.26.0",
+     "react-native-url-polyfill": "^4.0.0",
+-    "react-native-web": "^0.21.2"
++    "react-native-web": "^0.21.2",
++    "react-native-webview": "13.16.1"
+   },
+   "devDependencies": {
+     "@types/react": "~19.2.2",
+diff --git a/apps/user-app/src/data/device/DeviceLocation.ts b/apps/user-app/src/data/device/DeviceLocation.ts
+new file mode 100644
+index 0000000..4809715
+--- /dev/null
++++ b/apps/user-app/src/data/device/DeviceLocation.ts
+@@ -0,0 +1,34 @@
++import * as Location from "expo-location";
++import type { ReferenceLocation } from "../../domain/models";
++import { formatPlaceLabel } from "../../domain/placeLabel";
++export type Coordinates = Pick<ReferenceLocation, "latitude" | "longitude">;
++/**
++ * Foreground-only permission, requested when the user taps the button.
++ * Coordinates are used for distance search and are never persisted.
++ */
++export async function getCurrentCoordinates(): Promise<Coordinates> {
++  const permission = await Location.requestForegroundPermissionsAsync();
++  if (!permission.granted)
++    throw new Error(
++      "Izin lokasi ditolak. Aktifkan di pengaturan, atau pilih titik di peta.",
++    );
++  const position = await Location.getCurrentPositionAsync({
++    accuracy: Location.Accuracy.Balanced,
++  });
++  return {
++    latitude: position.coords.latitude,
++    longitude: position.coords.longitude,
++  };
++}
++/** Human-readable label; falls back to a neutral name if geocoding fails. */
++export async function describeCoordinates(
++  point: Coordinates,
++  fallback: string,
++): Promise<string> {
++  try {
++    const [address] = await Location.reverseGeocodeAsync(point);
++    return formatPlaceLabel(address, fallback);
++  } catch {
++    return fallback;
++  }
++}
+diff --git a/apps/user-app/src/domain/placeLabel.ts b/apps/user-app/src/domain/placeLabel.ts
+new file mode 100644
+index 0000000..3e42f57
+--- /dev/null
++++ b/apps/user-app/src/domain/placeLabel.ts
+@@ -0,0 +1,20 @@
++export interface AddressParts {
++  name?: string | null;
++  street?: string | null;
++  district?: string | null;
++  subregion?: string | null;
++  city?: string | null;
++}
++/** Short label such as "Jl. Kaliurang · Sleman"; never returns an empty string. */
++export function formatPlaceLabel(
++  address: AddressParts | null | undefined,
++  fallback: string,
++): string {
++  if (!address) return fallback;
++  const first = address.name || address.street || address.district;
++  const second = address.city || address.subregion;
++  const parts = [first, second]
++    .map((part) => part?.trim())
++    .filter((part): part is string => !!part);
++  return [...new Set(parts)].join(" · ") || fallback;
++}
+diff --git a/apps/user-app/src/presentation/components/LocationSheet.tsx b/apps/user-app/src/presentation/components/LocationSheet.tsx
+index 38a0845..b6a41ac 100644
+--- a/apps/user-app/src/presentation/components/LocationSheet.tsx
++++ b/apps/user-app/src/presentation/components/LocationSheet.tsx
+@@ -1,8 +1,13 @@
+ import { useState } from "react";
+-import { Text, TextInput, StyleSheet } from "react-native";
++import { Text, StyleSheet } from "react-native";
+ import type { ReferenceLocation } from "../../domain/models";
+ import { Sheet } from "./Sheet";
+ import { Button, Chip } from "./Primitives";
++import { MapPickerModal } from "./MapPickerModal";
++import {
++  describeCoordinates,
++  getCurrentCoordinates,
++} from "../../data/device/DeviceLocation";
+ import { colors } from "../theme";
+ const places: ReferenceLocation[] = [
+   { label: "UGM · Sleman", latitude: -7.7714, longitude: 110.3775 },
+@@ -15,83 +20,67 @@ const places: ReferenceLocation[] = [
+   { label: "UNDIP · Semarang", latitude: -7.0518, longitude: 110.4406 },
+ ];
+ export function LocationSheet({
++  current,
+   onClose,
+   onSelect,
+ }: {
++  current: ReferenceLocation | null;
+   onClose: () => void;
+   onSelect: (p: ReferenceLocation | null) => void;
+ }) {
+-  const [label, setLabel] = useState(""),
+-    [lat, setLat] = useState(""),
+-    [lon, setLon] = useState(""),
+-    [error, setError] = useState("");
+-  function apply() {
+-    const a = Number(lat),
+-      b = Number(lon);
+-    if (
+-      !label.trim() ||
+-      !lat.trim() ||
+-      !lon.trim() ||
+-      !Number.isFinite(a) ||
+-      !Number.isFinite(b) ||
+-      Math.abs(a) > 90 ||
+-      Math.abs(b) > 180
+-    ) {
+-      setError("Isi nama lokasi dan koordinat yang valid.");
+-      return;
++  const [error, setError] = useState(""),
++    [busy, setBusy] = useState(false),
++    [mapOpen, setMapOpen] = useState(false);
++  async function useMyLocation() {
++    setError("");
++    setBusy(true);
++    try {
++      const point = await getCurrentCoordinates();
++      const label = await describeCoordinates(point, "Lokasi saya");
++      onSelect({ label, ...point });
++    } catch (e) {
++      setError(e instanceof Error ? e.message : "Lokasi belum bisa diambil.");
++    } finally {
++      setBusy(false);
+     }
+-    onSelect({ label: label.trim(), latitude: a, longitude: b });
+   }
+   return (
+-    <Sheet visible title="Lokasi acuan" onClose={onClose}>
+-      <Text style={styles.help}>
+-        Pilih titik acuan atau masukkan koordinat tempatmu. Jarak dihitung
+-        sebagai garis lurus.
+-      </Text>
+-      {places.map((p) => (
+-        <Chip key={p.label} label={p.label} onPress={() => onSelect(p)} />
+-      ))}
+-      <Text style={styles.help}>Lokasi lain</Text>
+-      <TextInput
+-        accessibilityLabel="Nama lokasi"
+-        style={styles.input}
+-        placeholder="Nama lokasi"
+-        value={label}
+-        onChangeText={setLabel}
+-      />
+-      <TextInput
+-        accessibilityLabel="Latitude"
+-        style={styles.input}
+-        placeholder="Latitude, contoh -7.77"
+-        value={lat}
+-        onChangeText={setLat}
+-        keyboardType="numbers-and-punctuation"
+-      />
+-      <TextInput
+-        accessibilityLabel="Longitude"
+-        style={styles.input}
+-        placeholder="Longitude, contoh 110.37"
+-        value={lon}
+-        onChangeText={setLon}
+-        keyboardType="numbers-and-punctuation"
+-      />
+-      {!!error && <Text style={{ color: colors.danger }}>{error}</Text>}
+-      <Button title="Gunakan lokasi" onPress={apply} />
+-      <Button
+-        secondary
+-        title="Hapus lokasi acuan"
+-        onPress={() => onSelect(null)}
+-      />
+-    </Sheet>
++    <>
++      <Sheet visible={!mapOpen} title="Lokasi acuan" onClose={onClose}>
++        <Text style={styles.help}>
++          Pilih titik acuan untuk menghitung jarak (garis lurus) ke kos.
++        </Text>
++        <Button
++          title={busy ? "Mencari lokasimu…" : "Gunakan lokasi saya"}
++          disabled={busy}
++          onPress={useMyLocation}
++        />
++        <Button
++          secondary
++          title="Pilih di peta"
++          onPress={() => setMapOpen(true)}
++        />
++        {!!error && <Text style={{ color: colors.danger }}>{error}</Text>}
++        <Text style={styles.help}>Atau pilih titik populer</Text>
++        {places.map((p) => (
++          <Chip key={p.label} label={p.label} onPress={() => onSelect(p)} />
++        ))}
++        <Button
++          secondary
++          title="Hapus lokasi acuan"
++          onPress={() => onSelect(null)}
++        />
++      </Sheet>
++      {mapOpen && (
++        <MapPickerModal
++          initial={current}
++          onClose={() => setMapOpen(false)}
++          onConfirm={onSelect}
++        />
++      )}
++    </>
+   );
+ }
+ const styles = StyleSheet.create({
+   help: { fontSize: 13, lineHeight: 20, color: colors.muted },
+-  input: {
+-    borderWidth: 1,
+-    borderColor: colors.line,
+-    borderRadius: 8,
+-    padding: 13,
+-    color: colors.ink,
+-  },
+ });
+diff --git a/apps/user-app/src/presentation/components/MapPickerModal.tsx b/apps/user-app/src/presentation/components/MapPickerModal.tsx
+new file mode 100644
+index 0000000..a112258
+--- /dev/null
++++ b/apps/user-app/src/presentation/components/MapPickerModal.tsx
+@@ -0,0 +1,137 @@
++import { useMemo, useRef, useState } from "react";
++import { Modal, Pressable, StyleSheet, Text, View } from "react-native";
++import { WebView, type WebViewMessageEvent } from "react-native-webview";
++import { SafeAreaView } from "react-native-safe-area-context";
++import type { ReferenceLocation } from "../../domain/models";
++import { describeCoordinates } from "../../data/device/DeviceLocation";
++import { Button } from "./Primitives";
++import { colors } from "../theme";
++const fallback = { latitude: -7.7714, longitude: 110.3775 };
++/**
++ * OpenStreetMap through Leaflet inside a WebView: no Google Maps key and
++ * no native map SDK. Tiles come from OSM's public server, which is fine for
++ * a demo; switch `tileUrl` to a hosted tile provider before heavy traffic.
++ */
++const tileUrl = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
++function buildHtml(lat: number, lon: number) {
++  return `<!doctype html><html><head><meta charset="utf-8">
++<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
++<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
++<style>html,body,#map{height:100%;margin:0}</style></head>
++<body><div id="map"></div>
++<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
++<script>
++var map=L.map('map').setView([${Number(lat)},${Number(lon)}],15);
++L.tileLayer(${JSON.stringify(tileUrl)},{maxZoom:19,
++attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
++function send(){var c=map.getCenter();
++window.ReactNativeWebView.postMessage(JSON.stringify({latitude:c.lat,longitude:c.lng}));}
++map.on('moveend',send);send();
++</script></body></html>`;
++}
++export function MapPickerModal({
++  initial,
++  onClose,
++  onConfirm,
++}: {
++  initial: ReferenceLocation | null;
++  onClose: () => void;
++  onConfirm: (point: ReferenceLocation) => void;
++}) {
++  const start = initial ?? fallback;
++  const html = useMemo(
++    () => buildHtml(start.latitude, start.longitude),
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++    [],
++  );
++  const center = useRef({ latitude: start.latitude, longitude: start.longitude });
++  const [busy, setBusy] = useState(false);
++  function onMessage(event: WebViewMessageEvent) {
++    try {
++      const data = JSON.parse(event.nativeEvent.data) as {
++        latitude?: unknown;
++        longitude?: unknown;
++      };
++      if (
++        typeof data.latitude === "number" &&
++        typeof data.longitude === "number" &&
++        Number.isFinite(data.latitude) &&
++        Number.isFinite(data.longitude)
++      )
++        center.current = { latitude: data.latitude, longitude: data.longitude };
++    } catch {
++      /* ignore malformed messages */
++    }
++  }
++  async function confirm() {
++    setBusy(true);
++    const point = center.current;
++    const label = await describeCoordinates(point, "Titik di peta");
++    setBusy(false);
++    onConfirm({ label, ...point });
++  }
++  return (
++    <Modal visible animationType="slide" onRequestClose={onClose}>
++      <SafeAreaView style={styles.safe}>
++        <View style={styles.header}>
++          <Text style={styles.title}>Geser peta ke lokasimu</Text>
++          <Pressable
++            accessibilityRole="button"
++            accessibilityLabel="Tutup peta"
++            hitSlop={12}
++            onPress={onClose}
++          >
++            <Text style={styles.close}>×</Text>
++          </Pressable>
++        </View>
++        <View style={styles.mapWrap}>
++          <WebView
++            originWhitelist={["https://*", "about:*"]}
++            source={{ html, baseUrl: "https://kosku.demo/" }}
++            onMessage={onMessage}
++            javaScriptEnabled
++            style={StyleSheet.absoluteFill}
++          />
++          <View pointerEvents="none" style={styles.pinWrap}>
++            <Text style={styles.pin}>⌖</Text>
++          </View>
++        </View>
++        <View style={styles.footer}>
++          <Text style={styles.hint}>
++            Titik acuan adalah bidik di tengah peta. Jarak dihitung sebagai
++            garis lurus. Peta © kontributor OpenStreetMap.
++          </Text>
++          <Button
++            title={busy ? "Memproses…" : "Pilih titik ini"}
++            disabled={busy}
++            onPress={confirm}
++          />
++        </View>
++      </SafeAreaView>
++    </Modal>
++  );
++}
++const styles = StyleSheet.create({
++  safe: { flex: 1, backgroundColor: "#fff" },
++  header: {
++    padding: 20,
++    flexDirection: "row",
++    justifyContent: "space-between",
++    alignItems: "center",
++  },
++  title: { fontSize: 18, fontWeight: "700", color: colors.primary },
++  close: { fontSize: 27, color: colors.primary },
++  mapWrap: { flex: 1 },
++  pinWrap: {
++    position: "absolute",
++    top: 0,
++    bottom: 0,
++    left: 0,
++    right: 0,
++    alignItems: "center",
++    justifyContent: "center",
++  },
++  pin: { fontSize: 44, color: colors.danger },
++  footer: { padding: 20, gap: 12 },
++  hint: { fontSize: 12, color: colors.muted, textAlign: "center" },
++});
+diff --git a/apps/user-app/src/presentation/components/MapPickerModal.web.tsx b/apps/user-app/src/presentation/components/MapPickerModal.web.tsx
+new file mode 100644
+index 0000000..372bcf4
+--- /dev/null
++++ b/apps/user-app/src/presentation/components/MapPickerModal.web.tsx
+@@ -0,0 +1,19 @@
++import { Text } from "react-native";
++import type { ReferenceLocation } from "../../domain/models";
++import { Sheet } from "./Sheet";
++import { Button } from "./Primitives";
++/** Maps are Android-only for now; the web build shows a notice instead. */
++export function MapPickerModal({
++  onClose,
++}: {
++  initial: ReferenceLocation | null;
++  onClose: () => void;
++  onConfirm: (point: ReferenceLocation) => void;
++}) {
++  return (
++    <Sheet visible title="Peta" onClose={onClose}>
++      <Text>Pemilihan lewat peta tersedia di aplikasi Android.</Text>
++      <Button title="Tutup" onPress={onClose} secondary />
++    </Sheet>
++  );
++}
+diff --git a/apps/user-app/src/presentation/screens/HomeScreen.tsx b/apps/user-app/src/presentation/screens/HomeScreen.tsx
+index 929b026..bf6a779 100644
+--- a/apps/user-app/src/presentation/screens/HomeScreen.tsx
++++ b/apps/user-app/src/presentation/screens/HomeScreen.tsx
+@@ -217,6 +217,7 @@ export function HomeScreen({ navigation }: ScreenProps<"Home">) {
+         )}
+         {sheet === "location" && (
+           <LocationSheet
++            current={query.reference}
+             onClose={() => setSheet(null)}
+             onSelect={(reference) => {
+               setQuery({
+diff --git a/package-lock.json b/package-lock.json
+index ab3a405..fe58733 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -31,6 +31,7 @@
+         "@react-navigation/native-stack": "^7.19.2",
+         "@supabase/supabase-js": "^2.117.2",
+         "expo": "~57.0.25",
++        "expo-location": "~57.0.20",
+         "expo-status-bar": "~57.0.1",
+         "react": "19.2.3",
+         "react-dom": "19.2.3",
+@@ -38,7 +39,8 @@
+         "react-native-safe-area-context": "~5.7.0",
+         "react-native-screens": "~4.26.0",
+         "react-native-url-polyfill": "^4.0.0",
+-        "react-native-web": "^0.21.2"
++        "react-native-web": "^0.21.2",
++        "react-native-webview": "13.16.1"
+       },
+       "devDependencies": {
+         "@types/react": "~19.2.2",
+@@ -5903,6 +5905,18 @@
+         "react": "*"
+       }
+     },
++    "node_modules/expo-location": {
++      "version": "57.0.20",
++      "resolved": "https://registry.npmjs.org/expo-location/-/expo-location-57.0.20.tgz",
++      "integrity": "sha512-E9cr7A5eQS91bm3McMx3FiWy7SCorVTPLq9gLFFW+7dfuSqQp5FLNBZQ6NFJaS8tVhCyl2WyKMFh0TAo/+7K9Q==",
++      "license": "MIT",
++      "dependencies": {
++        "@expo/image-utils": "^0.11.5"
++      },
++      "peerDependencies": {
++        "expo": "*"
++      }
++    },
+     "node_modules/expo-modules-autolinking": {
+       "version": "57.0.13",
+       "resolved": "https://registry.npmjs.org/expo-modules-autolinking/-/expo-modules-autolinking-57.0.13.tgz",
+@@ -9388,6 +9402,20 @@
+       "integrity": "sha512-rkpe71W0N0c0Xz6QD0eJETuWAJGnJ9afsl1srmwPrI+yBCkge5EycXXbYRyvL29zZVUWQCY7InPRCv3GDXuZNw==",
+       "license": "MIT"
+     },
++    "node_modules/react-native-webview": {
++      "version": "13.16.1",
++      "resolved": "https://registry.npmjs.org/react-native-webview/-/react-native-webview-13.16.1.tgz",
++      "integrity": "sha512-If0eHhoEdOYDcHsX+xBFwHMbWBGK1BvGDQDQdVkwtSIXiq1uiqjkpWVP2uQ1as94J0CzvFE9PUNDuhiX0Z6ubw==",
++      "license": "MIT",
++      "dependencies": {
++        "escape-string-regexp": "^4.0.0",
++        "invariant": "2.2.4"
++      },
++      "peerDependencies": {
++        "react": "*",
++        "react-native": "*"
++      }
++    },
+     "node_modules/react-native/node_modules/babel-plugin-syntax-hermes-parser": {
+       "version": "0.36.0",
+       "resolved": "https://registry.npmjs.org/babel-plugin-syntax-hermes-parser/-/babel-plugin-syntax-hermes-parser-0.36.0.tgz",
+diff --git a/tests/placeLabel.test.mjs b/tests/placeLabel.test.mjs
+new file mode 100644
+index 0000000..4f536ae
+--- /dev/null
++++ b/tests/placeLabel.test.mjs
+@@ -0,0 +1,12 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { formatPlaceLabel } from "../apps/user-app/src/domain/placeLabel.ts";
++test("Place label is short, deduplicated and never empty", () => {
++  assert.equal(
++    formatPlaceLabel({ street: "Jl. Kaliurang", city: "Sleman" }, "x"),
++    "Jl. Kaliurang · Sleman",
++  );
++  assert.equal(formatPlaceLabel({ name: "Sleman", city: "Sleman" }, "x"), "Sleman");
++  assert.equal(formatPlaceLabel({}, "Titik di peta"), "Titik di peta");
++  assert.equal(formatPlaceLabel(null, "Lokasi saya"), "Lokasi saya");
++});

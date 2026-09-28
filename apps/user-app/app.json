@@ -16,6 +16,14 @@
     "web": {
       "favicon": "./assets/favicon.png"
     },
-    "scheme": "kosku"
+    "scheme": "kosku",
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "KosKu memakai lokasimu hanya untuk menghitung jarak ke kos. Lokasi tidak disimpan."
+        }
+      ]
+    ]
   }
 }

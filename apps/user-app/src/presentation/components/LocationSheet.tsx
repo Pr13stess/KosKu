@@ -1,8 +1,13 @@
 import { useState } from "react";
-import { Text, TextInput, StyleSheet } from "react-native";
+import { Text, StyleSheet } from "react-native";
 import type { ReferenceLocation } from "../../domain/models";
 import { Sheet } from "./Sheet";
 import { Button, Chip } from "./Primitives";
+import { MapPickerModal } from "./MapPickerModal";
+import {
+  describeCoordinates,
+  getCurrentCoordinates,
+} from "../../data/device/DeviceLocation";
 import { colors } from "../theme";
 const places: ReferenceLocation[] = [
   { label: "UGM · Sleman", latitude: -7.7714, longitude: 110.3775 },
@@ -15,83 +20,67 @@ const places: ReferenceLocation[] = [
   { label: "UNDIP · Semarang", latitude: -7.0518, longitude: 110.4406 },
 ];
 export function LocationSheet({
+  current,
   onClose,
   onSelect,
 }: {
+  current: ReferenceLocation | null;
   onClose: () => void;
   onSelect: (p: ReferenceLocation | null) => void;
 }) {
-  const [label, setLabel] = useState(""),
-    [lat, setLat] = useState(""),
-    [lon, setLon] = useState(""),
-    [error, setError] = useState("");
-  function apply() {
-    const a = Number(lat),
-      b = Number(lon);
-    if (
-      !label.trim() ||
-      !lat.trim() ||
-      !lon.trim() ||
-      !Number.isFinite(a) ||
-      !Number.isFinite(b) ||
-      Math.abs(a) > 90 ||
-      Math.abs(b) > 180
-    ) {
-      setError("Isi nama lokasi dan koordinat yang valid.");
-      return;
+  const [error, setError] = useState(""),
+    [busy, setBusy] = useState(false),
+    [mapOpen, setMapOpen] = useState(false);
+  async function useMyLocation() {
+    setError("");
+    setBusy(true);
+    try {
+      const point = await getCurrentCoordinates();
+      const label = await describeCoordinates(point, "Lokasi saya");
+      onSelect({ label, ...point });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Lokasi belum bisa diambil.");
+    } finally {
+      setBusy(false);
     }
-    onSelect({ label: label.trim(), latitude: a, longitude: b });
   }
   return (
-    <Sheet visible title="Lokasi acuan" onClose={onClose}>
-      <Text style={styles.help}>
-        Pilih titik acuan atau masukkan koordinat tempatmu. Jarak dihitung
-        sebagai garis lurus.
-      </Text>
-      {places.map((p) => (
-        <Chip key={p.label} label={p.label} onPress={() => onSelect(p)} />
-      ))}
-      <Text style={styles.help}>Lokasi lain</Text>
-      <TextInput
-        accessibilityLabel="Nama lokasi"
-        style={styles.input}
-        placeholder="Nama lokasi"
-        value={label}
-        onChangeText={setLabel}
-      />
-      <TextInput
-        accessibilityLabel="Latitude"
-        style={styles.input}
-        placeholder="Latitude, contoh -7.77"
-        value={lat}
-        onChangeText={setLat}
-        keyboardType="numbers-and-punctuation"
-      />
-      <TextInput
-        accessibilityLabel="Longitude"
-        style={styles.input}
-        placeholder="Longitude, contoh 110.37"
-        value={lon}
-        onChangeText={setLon}
-        keyboardType="numbers-and-punctuation"
-      />
-      {!!error && <Text style={{ color: colors.danger }}>{error}</Text>}
-      <Button title="Gunakan lokasi" onPress={apply} />
-      <Button
-        secondary
-        title="Hapus lokasi acuan"
-        onPress={() => onSelect(null)}
-      />
-    </Sheet>
+    <>
+      <Sheet visible={!mapOpen} title="Lokasi acuan" onClose={onClose}>
+        <Text style={styles.help}>
+          Pilih titik acuan untuk menghitung jarak (garis lurus) ke kos.
+        </Text>
+        <Button
+          title={busy ? "Mencari lokasimu…" : "Gunakan lokasi saya"}
+          disabled={busy}
+          onPress={useMyLocation}
+        />
+        <Button
+          secondary
+          title="Pilih di peta"
+          onPress={() => setMapOpen(true)}
+        />
+        {!!error && <Text style={{ color: colors.danger }}>{error}</Text>}
+        <Text style={styles.help}>Atau pilih titik populer</Text>
+        {places.map((p) => (
+          <Chip key={p.label} label={p.label} onPress={() => onSelect(p)} />
+        ))}
+        <Button
+          secondary
+          title="Hapus lokasi acuan"
+          onPress={() => onSelect(null)}
+        />
+      </Sheet>
+      {mapOpen && (
+        <MapPickerModal
+          initial={current}
+          onClose={() => setMapOpen(false)}
+          onConfirm={onSelect}
+        />
+      )}
+    </>
   );
 }
 const styles = StyleSheet.create({
   help: { fontSize: 13, lineHeight: 20, color: colors.muted },
-  input: {
-    borderWidth: 1,
-    borderColor: colors.line,
-    borderRadius: 8,
-    padding: 13,
-    color: colors.ink,
-  },
 });
