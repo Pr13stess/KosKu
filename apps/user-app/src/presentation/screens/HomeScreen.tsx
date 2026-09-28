@@ -10,7 +10,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { defaultQuery } from "../../domain/models";
 import { useRepositories } from "../../providers/RepositoryProvider";
-import type { ScreenProps } from "../../navigation/types";
+import type { TabScreenProps } from "../../navigation/types";
 import { useResource } from "../hooks/useResource";
 import { useAuthSession } from "../hooks/useAuthSession";
 import { colors } from "../theme";
@@ -19,7 +19,8 @@ import { Status, Button } from "../components/Primitives";
 import { FilterSheet } from "../components/FilterSheet";
 import { LocationSheet } from "../components/LocationSheet";
 import { Sheet } from "../components/Sheet";
-export function HomeScreen({ navigation }: ScreenProps<"Home">) {
+
+export function HomeScreen({ navigation }: TabScreenProps<"HomeTab">) {
   const { properties, auth, mode } = useRepositories();
   const { session } = useAuthSession();
   const [query, setQuery] = useState(defaultQuery),
@@ -172,39 +173,7 @@ export function HomeScreen({ navigation }: ScreenProps<"Home">) {
             }
           />
         )}
-        <View style={styles.dock}>
-          {[
-            { icon: "⌂", label: "Home" },
-            { icon: "☷", label: "Chat" },
-            { icon: "▣", label: "Booking" },
-            { icon: "◎", label: "Profil" },
-          ].map((item, i) => (
-            <Pressable
-              key={item.label}
-              accessibilityRole="button"
-              accessibilityLabel={item.label}
-              onPress={() => {
-                if (i === 0) return;
-                setSheet(i === 3 ? "profile" : "future");
-              }}
-              style={styles.dockItem}
-            >
-              <View style={[styles.dockIcon, i === 0 && styles.dockActive]}>
-                <Text style={[styles.navSymbol, i === 0 && { color: "#fff" }]}>
-                  {item.icon}
-                </Text>
-              </View>
-              <Text
-                style={[
-                  styles.dockLabel,
-                  i === 0 && { color: colors.primary, fontWeight: "700" },
-                ]}
-              >
-                {item.label}
-              </Text>
-            </Pressable>
-          ))}
-        </View>
+
         {sheet === "filter" && (
           <FilterSheet
             query={query}
@@ -266,9 +235,11 @@ export function HomeScreen({ navigation }: ScreenProps<"Home">) {
     </SafeAreaView>
   );
 }
+
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.background },
   container: { flex: 1, width: "100%", maxWidth: 600, alignSelf: "center" },
+  future: { fontSize: 14, lineHeight: 22, color: colors.muted },
   header: {
     flexDirection: "row",
     justifyContent: "space-between",
@@ -352,30 +323,4 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
   },
-  dock: {
-    position: "absolute",
-    left: 20,
-    right: 20,
-    bottom: 20,
-    borderRadius: 32,
-    backgroundColor: "#fff",
-    paddingVertical: 9,
-    flexDirection: "row",
-    justifyContent: "space-around",
-    boxShadow: "0px 4px 14px #00000015",
-    borderWidth: 1,
-    borderColor: colors.line,
-  },
-  dockItem: { alignItems: "center", gap: 3, minWidth: 52 },
-  dockIcon: {
-    width: 35,
-    height: 35,
-    borderRadius: 22,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  dockActive: { backgroundColor: colors.primary },
-  navSymbol: { fontSize: 23, color: colors.primary },
-  dockLabel: { fontSize: 9, color: colors.muted },
-  future: { fontSize: 14, lineHeight: 22, color: colors.muted },
 });

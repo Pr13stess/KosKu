@@ -2,13 +2,18 @@ import { ActivityIndicator, View } from "react-native";
 import { NavigationContainer } from "@react-navigation/native";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import type { RootStackParamList } from "./types";
+import { MainTabs } from "./MainTabs";
 import { useAuthSession } from "../presentation/hooks/useAuthSession";
 import { LoginScreen } from "../presentation/screens/LoginScreen";
 import { RegisterScreen } from "../presentation/screens/RegisterScreen";
-import { HomeScreen } from "../presentation/screens/HomeScreen";
 import { PropertyDetailScreen } from "../presentation/screens/PropertyDetailScreen";
 import { RoomSelectionScreen } from "../presentation/screens/RoomSelectionScreen";
 import { PlanSelectionScreen } from "../presentation/screens/PlanSelectionScreen";
+import { EditProfileScreen } from "../presentation/screens/profile/EditProfileScreen";
+import { ChangePasswordScreen } from "../presentation/screens/profile/ChangePasswordScreen";
+import { PolicyScreen } from "../presentation/screens/profile/PolicyScreen";
+import { InfoScreen } from "../presentation/screens/profile/InfoScreen";
+import { ComingSoonScreen } from "../presentation/screens/profile/PlaceholderScreen";
 import { colors } from "../presentation/theme";
 const Stack = createNativeStackNavigator<RootStackParamList>();
 function LoadingScreen() {
@@ -53,8 +58,8 @@ export function RootNavigator() {
         ) : (
           <>
             <Stack.Screen
-              name="Home"
-              component={HomeScreen}
+              name="Main"
+              component={MainTabs}
               options={{ headerShown: false }}
             />
             <Stack.Screen
@@ -71,6 +76,31 @@ export function RootNavigator() {
               name="PlanSelection"
               component={PlanSelectionScreen}
               options={{ title: "Pilih paket sewa" }}
+            />
+            <Stack.Screen
+              name="EditProfile"
+              component={EditProfileScreen}
+              options={{ title: "Ubah profil" }}
+            />
+            <Stack.Screen
+              name="ChangePassword"
+              component={ChangePasswordScreen}
+              options={{ title: "Ubah password" }}
+            />
+            <Stack.Screen
+              name="Policy"
+              component={PolicyScreen}
+              options={{ title: "Kebijakan" }}
+            />
+            <Stack.Screen
+              name="Info"
+              component={InfoScreen}
+              options={{ title: "Informasi" }}
+            />
+            <Stack.Screen
+              name="ComingSoon"
+              component={ComingSoonScreen}
+              options={({ route }) => ({ title: route.params.title })}
             />
           </>
         )}

@@ -11,19 +11,23 @@ import type { PropertyRepository } from "../domain/repositories/PropertyReposito
 import type { RoomRepository } from "../domain/repositories/RoomRepository";
 import type { PricingRepository } from "../domain/repositories/PricingRepository";
 import type { AuthRepository } from "../domain/repositories/AuthRepository";
+import type { ProfileRepository } from "../domain/repositories/ProfileRepository";
 import { MockPropertyRepository } from "../data/mock/MockPropertyRepository";
 import { MockRoomRepository } from "../data/mock/MockRoomRepository";
 import { MockPricingRepository } from "../data/mock/MockPricingRepository";
 import { MockAuthRepository } from "../data/mock/MockAuthRepository";
+import { MockProfileRepository } from "../data/mock/MockProfileRepository";
 import { SupabasePropertyRepository } from "../data/supabase/SupabasePropertyRepository";
 import { SupabaseRoomRepository } from "../data/supabase/SupabaseRoomRepository";
 import { SupabasePricingRepository } from "../data/supabase/SupabasePricingRepository";
 import { SupabaseAuthRepository } from "../data/supabase/SupabaseAuthRepository";
+import { SupabaseProfileRepository } from "../data/supabase/SupabaseProfileRepository";
 export interface Repositories {
   properties: PropertyRepository;
   rooms: RoomRepository;
   pricing: PricingRepository;
   auth: AuthRepository;
+  profiles: ProfileRepository;
   mode: "mock" | "supabase";
 }
 const Context = createContext<Repositories | null>(null);
@@ -46,6 +50,7 @@ function compose(): Repositories {
       rooms: new SupabaseRoomRepository(client),
       pricing: new SupabasePricingRepository(client),
       auth: new SupabaseAuthRepository(client),
+      profiles: new SupabaseProfileRepository(client),
       mode: "supabase",
     };
   }
@@ -54,6 +59,7 @@ function compose(): Repositories {
     rooms: new MockRoomRepository(),
     pricing: new MockPricingRepository(),
     auth: new MockAuthRepository(),
+    profiles: new MockProfileRepository(),
     mode: "mock",
   };
 }

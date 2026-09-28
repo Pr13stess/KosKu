@@ -12,11 +12,16 @@ import type { ScreenProps } from "../../navigation/types";
 import { useRepositories } from "../../providers/RepositoryProvider";
 import { Button } from "../components/Primitives";
 import { colors } from "../theme";
+
+
 export function RegisterScreen({ navigation }: ScreenProps<"Register">) {
   const { auth, mode } = useRepositories();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
+  const [fullName, setFullName] = useState("");
+  const [phone, setPhone] = useState("");
+  const [campus, setCampus] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -29,7 +34,12 @@ export function RegisterScreen({ navigation }: ScreenProps<"Register">) {
     }
     setSubmitting(true);
     try {
-      await auth.signUp(email, password);
+      await auth.signUp(email, password, {
+        full_name: fullName.trim(),
+        phone: phone.replace(/[\s-]/g, ""),
+        campus: campus.trim(),
+      });
+
       if (mode === "supabase") {
         // Supabase may require email confirmation depending on project
         // settings; either way there is no session to react to yet.
