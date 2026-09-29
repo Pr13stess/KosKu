@@ -74,6 +74,26 @@ export interface AuthUser {
 export interface Session {
   user: AuthUser;
 }
+export type MessageType = "TEXT" | "IMAGE" | "CALL_EVENT";
+export interface Message {
+  id: string;
+  conversation_id: string;
+  sender_id: string | null;
+  message_type: MessageType;
+  text_content: string | null;
+  image_url: string | null;
+  client_message_id: string;
+  created_at: string;
+}
+export interface Conversation {
+  id: string;
+  property_id: string;
+  property_name: string;
+  user_id: string | null;
+  owner_id: string | null;
+  updated_at: string;
+  last_message: Message | null;
+}
 export const defaultQuery: SearchQuery = {
   text: "",
   durationUnit: "MONTH",

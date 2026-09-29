@@ -17,6 +17,14 @@ Seluruh bagian 1–21 dokumen ditelaah sebelum implementasi. Dokumen revisi 2.0 
 11. Referensi identitas historis dapat menjadi NULL saat identitas dihapus, sedangkan notes/favorites/token bersifat cascade. Review mengizinkan anonimisasi user oleh backend. Alur hapus akun, anonimisasi isi chat/bukti, dan pembersihan Storage belum dibuat.
 12. Refund kumulatif non-FAILED tidak melebihi gross payment, idempotency payout tersedia, restriction aktif unik per pasangan, note dibatasi 10.000 karakter, dan token dibedakan per instalasi/aplikasi.
 
+## Chat teks dan gambar (menyusul first commit)
+
+13. `start_conversation(property_id)` (security definer) membuat conversation + kedua conversation_participants dalam satu transaksi, menolak jika owner memblokir komunikasi (`user_restrictions`), dan tidak pernah menerima `owner_id` dari client — dihitung dari `properties.owner_id` di server, sesuai batas "Perubahan role ... tidak dipercayakan kepada data kiriman client".
+14. `messages` mendapat `grant insert` + policy `sender_id = auth.uid() and private.in_conversation(conversation_id)`; peserta lain tetap tidak bisa menyisipkan pesan atas nama orang lain. Trigger `touch_conversation` memperbarui `conversations.updated_at` supaya daftar chat terurut tanpa client menulis ke tabel conversations.
+15. Bucket privat `chat-images` dan publication `supabase_realtime` untuk `messages` hanya dibuat jika schema/`publication` terkait ada (guard `do $$ if exists ... $$`), karena keduanya spesifik proyek Supabase asli dan tidak ada pada Postgres polos yang dipakai `tests/database.test.mjs` (PGlite).
+16. Voice/video call (Bagian 9) belum diimplementasikan: memerlukan Edge Function penerbit token Agora dan Expo Development Build (R7, R8), di luar cakupan lingkungan pengembangan saat ini. Tabel `calls` dan RLS SELECT-nya sudah ada dari first commit; tombol Call di UI tetap placeholder.
+17. `ChatListScreen` diisi sebagai konten tab `ChatTab` pada `MainTabs`, sedangkan `ChatScreen` (thread percakapan) tetap di root stack navigator supaya tab bar tersembunyi saat membuka satu percakapan, mengikuti pola `PropertyDetail`/`RoomSelection`.
+
 ## Entitas
 
 Identitas: profiles, user_roles, owner_profiles.

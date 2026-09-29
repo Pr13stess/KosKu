@@ -9,6 +9,7 @@ import { RegisterScreen } from "../presentation/screens/RegisterScreen";
 import { PropertyDetailScreen } from "../presentation/screens/PropertyDetailScreen";
 import { RoomSelectionScreen } from "../presentation/screens/RoomSelectionScreen";
 import { PlanSelectionScreen } from "../presentation/screens/PlanSelectionScreen";
+import { ChatScreen } from "../presentation/screens/chat/ChatScreen";
 import { EditProfileScreen } from "../presentation/screens/profile/EditProfileScreen";
 import { ChangePasswordScreen } from "../presentation/screens/profile/ChangePasswordScreen";
 import { PolicyScreen } from "../presentation/screens/profile/PolicyScreen";
@@ -76,6 +77,11 @@ export function RootNavigator() {
               name="PlanSelection"
               component={PlanSelectionScreen}
               options={{ title: "Pilih paket sewa" }}
+            />
+            <Stack.Screen
+              name="Chat"
+              component={ChatScreen}
+              options={{ title: "Chat" }}
             />
             <Stack.Screen
               name="EditProfile"

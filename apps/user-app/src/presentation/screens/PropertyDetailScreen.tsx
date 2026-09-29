@@ -29,7 +29,8 @@ export function PropertyDetailScreen({
   navigation,
 }: ScreenProps<"PropertyDetail">) {
   const { propertyId } = route.params;
-  const { properties, rooms } = useRepositories();
+  const { properties, rooms, chat } = useRepositories();
+  const [openingChat, setOpeningChat] = useState(false);
   const loader = useCallback(
     async () => ({
       property: await properties.get(propertyId),
@@ -54,9 +55,22 @@ export function PropertyDetailScreen({
   const roomList = state.data?.rooms ?? [];
   const canChoose = roomList.some((r) => r.available > 0 && r.plans.length > 0);
   const future = () =>
-    setNotice(
-      "Chat, panggilan, dan catatan akan tersedia pada tahap berikutnya.",
-    );
+    setNotice("Panggilan dan catatan akan tersedia pada tahap berikutnya.");
+  const openChat = async () => {
+    if (openingChat) return;
+    setOpeningChat(true);
+    try {
+      const conversation = await chat.startConversation(propertyId, p.name);
+      navigation.navigate("Chat", {
+        conversationId: conversation.id,
+        propertyName: conversation.property_name,
+      });
+    } catch (e) {
+      setNotice(e instanceof Error ? e.message : "Chat gagal dibuka.");
+    } finally {
+      setOpeningChat(false);
+    }
+  };
   return (
     <SafeAreaView edges={["bottom"]} style={styles.safe}>
       <ScrollView contentContainerStyle={styles.content}>
@@ -159,7 +173,17 @@ export function PropertyDetailScreen({
         </View>
       </ScrollView>
       <View style={styles.actions}>
-        {["Chat", "Call", "Catatan"].map((label) => (
+        <Pressable
+          accessibilityRole="button"
+          onPress={openChat}
+          disabled={openingChat}
+          style={styles.smallAction}
+        >
+          <Text style={styles.actionText}>
+            {openingChat ? "Membuka…" : "Chat"}
+          </Text>
+        </Pressable>
+        {["Call", "Catatan"].map((label) => (
           <Pressable
             accessibilityRole="button"
             key={label}

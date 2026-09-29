@@ -12,22 +12,26 @@ import type { RoomRepository } from "../domain/repositories/RoomRepository";
 import type { PricingRepository } from "../domain/repositories/PricingRepository";
 import type { AuthRepository } from "../domain/repositories/AuthRepository";
 import type { ProfileRepository } from "../domain/repositories/ProfileRepository";
+import type { ChatRepository } from "../domain/repositories/ChatRepository";
 import { MockPropertyRepository } from "../data/mock/MockPropertyRepository";
 import { MockRoomRepository } from "../data/mock/MockRoomRepository";
 import { MockPricingRepository } from "../data/mock/MockPricingRepository";
 import { MockAuthRepository } from "../data/mock/MockAuthRepository";
 import { MockProfileRepository } from "../data/mock/MockProfileRepository";
+import { MockChatRepository } from "../data/mock/MockChatRepository";
 import { SupabasePropertyRepository } from "../data/supabase/SupabasePropertyRepository";
 import { SupabaseRoomRepository } from "../data/supabase/SupabaseRoomRepository";
 import { SupabasePricingRepository } from "../data/supabase/SupabasePricingRepository";
 import { SupabaseAuthRepository } from "../data/supabase/SupabaseAuthRepository";
 import { SupabaseProfileRepository } from "../data/supabase/SupabaseProfileRepository";
+import { SupabaseChatRepository } from "../data/supabase/SupabaseChatRepository";
 export interface Repositories {
   properties: PropertyRepository;
   rooms: RoomRepository;
   pricing: PricingRepository;
   auth: AuthRepository;
   profiles: ProfileRepository;
+  chat: ChatRepository;
   mode: "mock" | "supabase";
 }
 const Context = createContext<Repositories | null>(null);
@@ -51,15 +55,18 @@ function compose(): Repositories {
       pricing: new SupabasePricingRepository(client),
       auth: new SupabaseAuthRepository(client),
       profiles: new SupabaseProfileRepository(client),
+      chat: new SupabaseChatRepository(client),
       mode: "supabase",
     };
   }
+  const auth = new MockAuthRepository();
   return {
     properties: new MockPropertyRepository(),
     rooms: new MockRoomRepository(),
     pricing: new MockPricingRepository(),
-    auth: new MockAuthRepository(),
+    auth,
     profiles: new MockProfileRepository(),
+    chat: new MockChatRepository(auth),
     mode: "mock",
   };
 }

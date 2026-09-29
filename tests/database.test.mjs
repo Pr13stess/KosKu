@@ -89,6 +89,61 @@ test("Migrations, seed, RLS isolation, aggregates and integrity", async (t) => {
       },
     );
     await t.test(
+      "start_conversation creates a conversation and participants; messages_insert requires participation and correct sender",
+      async () => {
+        await as("authenticated", id(4));
+        const newId = (
+          await rows(
+            `select public.start_conversation('00000000-0000-4000-8000-000000000101') as id`,
+          )
+        )[0].id;
+        assert.equal(
+          (
+            await rows(
+              `select * from public.conversation_participants where conversation_id='${newId}'`,
+            )
+          ).length,
+          2,
+        );
+        await rows(`insert into public.messages
+          (conversation_id, sender_id, message_type, text_content, client_message_id)
+          values ('${newId}', '${id(4)}', 'TEXT', 'Halo, kamarnya masih ada?', gen_random_uuid())`);
+        assert.equal(
+          (
+            await rows(`select * from public.messages where conversation_id='${newId}'`)
+          ).length,
+          1,
+        );
+        // id(3) is a participant of a different conversation, not this one.
+        await as("authenticated", id(3));
+        await assert.rejects(() =>
+          rows(`insert into public.messages
+            (conversation_id, sender_id, message_type, text_content, client_message_id)
+            values ('${newId}', '${id(3)}', 'TEXT', 'Menyusup', gen_random_uuid())`),
+        );
+        // Cannot spoof another participant's sender_id.
+        await as("authenticated", id(4));
+        await assert.rejects(() =>
+          rows(`insert into public.messages
+            (conversation_id, sender_id, message_type, text_content, client_message_id)
+            values ('${newId}', '${id(1)}', 'TEXT', 'Menyamar', gen_random_uuid())`),
+        );
+        // Owner blocks communication (written by backend/admin, not the
+        // client, so this row is inserted with RLS bypassed like a
+        // service-role write would be).
+        await db.exec("reset role");
+        await db.exec(`insert into public.user_restrictions
+          (owner_id, user_id, block_communication, block_booking, reason, status)
+          values ('${id(1)}', '${id(4)}', true, false, 'SPAM', 'ACTIVE')`);
+        await as("authenticated", id(4));
+        await assert.rejects(() =>
+          rows(
+            `select public.start_conversation('00000000-0000-4000-8000-000000000102')`,
+          ),
+        );
+      },
+    );
+    await t.test(
       "Clients cannot write roles, verification, inventory, bookings, payments or notes",
       async () => {
         await as("authenticated", id(3));

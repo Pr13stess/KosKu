@@ -10,6 +10,8 @@ import type {
   AvatarFile,
   ProfileRepository,
 } from "../../domain/repositories/ProfileRepository";
+import * as FileSystem from "expo-file-system/legacy";
+import { decode } from "base64-arraybuffer";
 
 const BUCKET = "avatars";
 const MAX_AVATAR_BYTES = 5 * 1024 * 1024;
@@ -98,7 +100,10 @@ export class SupabaseProfileRepository implements ProfileRepository {
     if (!ext) throw new Error("Format foto harus JPEG, PNG, atau WebP.");
     const user = await this.currentUser();
 
-    const body = await (await fetch(file.uri)).arrayBuffer();
+    const base64 = await FileSystem.readAsStringAsync(file.uri, {
+      encoding: FileSystem.EncodingType.Base64,
+    });
+    const body = decode(base64);
     if (body.byteLength > MAX_AVATAR_BYTES)
       throw new Error("Ukuran foto maksimal 5 MB.");
 

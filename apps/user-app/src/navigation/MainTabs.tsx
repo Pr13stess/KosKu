@@ -2,18 +2,13 @@ import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
 import type { MainTabParamList } from "./types";
 import { FloatingNavBar } from "./FloatingNavBar";
 import { HomeScreen } from "../presentation/screens/HomeScreen";
+import { ChatListScreen } from "../presentation/screens/chat/ChatListScreen";
 import { ProfileScreen } from "../presentation/screens/profile/ProfileScreen";
 import { PlaceholderScreen } from "../presentation/screens/profile/PlaceholderScreen";
 import { colors } from "../presentation/theme";
 
 const Tab = createBottomTabNavigator<MainTabParamList>();
 
-const ChatPlaceholder = () => (
-  <PlaceholderScreen
-    title="Chat belum tersedia"
-    description="Percakapan dengan pemilik kos akan muncul di sini."
-  />
-);
 const BookingPlaceholder = () => (
   <PlaceholderScreen
     title="Belum ada booking"
@@ -39,7 +34,7 @@ export function MainTabs() {
       />
       <Tab.Screen
         name="ChatTab"
-        component={ChatPlaceholder}
+        component={ChatListScreen}
         options={{ title: "Chat" }}
       />
       <Tab.Screen

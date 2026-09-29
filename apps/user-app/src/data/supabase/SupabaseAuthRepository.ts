@@ -5,6 +5,7 @@ import type {
 import type { AuthRepository } from "../../domain/repositories/AuthRepository";
 import type { Session } from "../../domain/models";
 import type { SignUpMetadata } from "../../domain/profile";
+
 function toSession(session: SupabaseSession | null): Session | null {
   if (!session?.user) return null;
   return { user: { id: session.user.id, email: session.user.email ?? null } };
