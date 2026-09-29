@@ -1,0 +1,1622 @@
+diff --git a/apps/user-app/src/data/mock/MockCheckoutRepository.ts b/apps/user-app/src/data/mock/MockCheckoutRepository.ts
+new file mode 100644
+index 0000000..abeab52
+--- /dev/null
++++ b/apps/user-app/src/data/mock/MockCheckoutRepository.ts
+@@ -0,0 +1,88 @@
++import type { CheckoutRepository } from "../../domain/repositories/CheckoutRepository";
++import type { Checkout } from "../../domain/models";
++import { CheckoutError } from "../../domain/checkoutErrors";
++import { summarizeCost } from "../../domain/pricing";
++import { mockProperties, mockRooms } from "./fixtures";
++const HOLD_MS = 15 * 60 * 1000;
++/** In-memory stand-in with the same rules as the SQL functions. */
++export class MockCheckoutRepository implements CheckoutRepository {
++  private readonly bookings = new Map<string, Checkout & { roomId: string }>();
++  constructor(private readonly now: () => number = Date.now) {}
++  private settle(b: Checkout & { roomId: string }) {
++    if (
++      (b.status === "HELD" || b.status === "PENDING_PAYMENT") &&
++      b.holdExpiresAt &&
++      Date.parse(b.holdExpiresAt) <= this.now()
++    ) {
++      b.status = "CANCELLED";
++      b.cancelReason = "HOLD_EXPIRED";
++      b.holdExpiresAt = null;
++      b.paymentStatus = "EXPIRED";
++    }
++  }
++  private find(id: string) {
++    const b = this.bookings.get(id);
++    if (!b) throw new CheckoutError("BOOKING_NOT_FOUND");
++    this.settle(b);
++    return b;
++  }
++  async start(planId: string) {
++    const room = mockRooms.find((r) => r.plans.some((p) => p.id === planId));
++    const plan = room?.plans.find((p) => p.id === planId);
++    if (!room || !plan) throw new CheckoutError("PLAN_UNAVAILABLE");
++    const cost = summarizeCost(plan);
++    if (cost.payNow <= 0) throw new CheckoutError("NO_UPFRONT_PAYMENT");
++    for (const b of this.bookings.values()) {
++      this.settle(b);
++      if (b.roomId === room.id && ["HELD", "PENDING_PAYMENT"].includes(b.status)) {
++        if (b.planName === plan.name) return { bookingId: b.bookingId };
++        throw new CheckoutError("ACTIVE_CHECKOUT_EXISTS");
++      }
++    }
++    const taken = [...this.bookings.values()].filter(
++      (b) => b.roomId === room.id && ["HELD", "PENDING_PAYMENT", "CONFIRMED"].includes(b.status),
++    ).length;
++    if (room.available - taken < 1) throw new CheckoutError("SOLD_OUT");
++    const bookingId = `mock-booking-${this.bookings.size + 1}`;
++    this.bookings.set(bookingId, {
++      roomId: room.id,
++      bookingId,
++      bookingCode: `KSK-MOCK${this.bookings.size + 1}`,
++      status: "PENDING_PAYMENT",
++      cancelReason: null,
++      propertyName: mockProperties.find((p) => p.id === room.property_id)?.name ?? "",
++      roomTypeName: room.name,
++      planName: plan.name,
++      rent: cost.rent,
++      downPayment: cost.downPayment,
++      securityDeposit: cost.deposit,
++      payNow: cost.payNow,
++      remainingRent: cost.remainingRent,
++      holdExpiresAt: new Date(this.now() + HOLD_MS).toISOString(),
++      serverNow: "",
++      paymentStatus: "PENDING",
++      redirectUrl: null,
++    });
++    return { bookingId };
++  }
++  async get(bookingId: string) {
++    const b = this.find(bookingId);
++    return { ...b, serverNow: new Date(this.now()).toISOString() };
++  }
++  async cancel(bookingId: string) {
++    const b = this.find(bookingId);
++    if (b.status === "CANCELLED") return;
++    if (b.status === "CONFIRMED") throw new CheckoutError("CANNOT_CANCEL_HERE");
++    b.status = "CANCELLED";
++    b.cancelReason = "USER_CANCELLED";
++    b.holdExpiresAt = null;
++    b.paymentStatus = "CANCELLED";
++  }
++  async simulatePayment(bookingId: string) {
++    const b = this.find(bookingId);
++    if (b.status !== "PENDING_PAYMENT") throw new CheckoutError("BOOKING_NOT_PAYABLE");
++    b.status = "CONFIRMED";
++    b.holdExpiresAt = null;
++    b.paymentStatus = "SUCCESS";
++  }
++}
+diff --git a/apps/user-app/src/data/supabase/SupabaseCheckoutRepository.ts b/apps/user-app/src/data/supabase/SupabaseCheckoutRepository.ts
+new file mode 100644
+index 0000000..add1b91
+--- /dev/null
++++ b/apps/user-app/src/data/supabase/SupabaseCheckoutRepository.ts
+@@ -0,0 +1,68 @@
++import { FunctionsHttpError, type SupabaseClient } from "@supabase/supabase-js";
++import type { CheckoutRepository } from "../../domain/repositories/CheckoutRepository";
++import type { BookingStatus, Checkout } from "../../domain/models";
++import { toCheckoutError } from "../../domain/checkoutErrors";
++const statuses: BookingStatus[] = [
++  "DRAFT", "HELD", "PENDING_PAYMENT", "CONFIRMED", "ACTIVE", "COMPLETED", "CANCELLED",
++];
++const text = (v: unknown, name: string) => {
++  if (typeof v !== "string") throw new Error(`Respons checkout tidak valid: ${name}`);
++  return v;
++};
++const num = (v: unknown, name: string) => {
++  const n = Number(v);
++  if (!Number.isFinite(n)) throw new Error(`Respons checkout tidak valid: ${name}`);
++  return n;
++};
++const orNull = (v: unknown) => (typeof v === "string" ? v : null);
++export function parseCheckout(raw: unknown): Checkout {
++  const r = (raw ?? {}) as Record<string, unknown>;
++  const status = text(r.status, "status") as BookingStatus;
++  if (!statuses.includes(status)) throw new Error("Respons checkout tidak valid: status");
++  return {
++    bookingId: text(r.booking_id, "booking_id"),
++    bookingCode: text(r.booking_code, "booking_code"),
++    status,
++    cancelReason: orNull(r.cancel_reason),
++    propertyName: text(r.property_name, "property_name"),
++    roomTypeName: text(r.room_type_name, "room_type_name"),
++    planName: text(r.plan_name, "plan_name"),
++    rent: num(r.rent, "rent"),
++    downPayment: num(r.down_payment, "down_payment"),
++    securityDeposit: num(r.security_deposit, "security_deposit"),
++    payNow: num(r.pay_now, "pay_now"),
++    remainingRent: num(r.remaining_rent, "remaining_rent"),
++    holdExpiresAt: orNull(r.hold_expires_at),
++    serverNow: text(r.server_now, "server_now"),
++    paymentStatus: orNull(r.payment_status),
++    redirectUrl: orNull(r.redirect_url),
++  };
++}
++async function failure(error: unknown): Promise<never> {
++  if (error instanceof FunctionsHttpError) {
++    const body = await error.context.json().catch(() => null);
++    throw toCheckoutError(body?.error ?? "");
++  }
++  throw toCheckoutError(error);
++}
++export class SupabaseCheckoutRepository implements CheckoutRepository {
++  constructor(private readonly client: SupabaseClient) {}
++  async start(planId: string) {
++    const { data, error } = await this.client.functions.invoke("create-payment", {
++      body: { plan_id: planId },
++    });
++    if (error) return failure(error);
++    return { bookingId: text(data?.booking_id, "booking_id") };
++  }
++  async get(bookingId: string) {
++    const { data, error } = await this.client.rpc("get_checkout", { p_booking_id: bookingId });
++    if (error) return failure(error.message);
++    return parseCheckout(data);
++  }
++  async cancel(bookingId: string) {
++    const { error } = await this.client.functions.invoke("cancel-payment", {
++      body: { booking_id: bookingId },
++    });
++    if (error) return failure(error);
++  }
++}
+diff --git a/apps/user-app/src/domain/checkoutErrors.ts b/apps/user-app/src/domain/checkoutErrors.ts
+new file mode 100644
+index 0000000..2e74dad
+--- /dev/null
++++ b/apps/user-app/src/domain/checkoutErrors.ts
+@@ -0,0 +1,35 @@
++const messages: Record<string, string> = {
++  SOLD_OUT: "Unit terakhir baru saja diambil pengguna lain. Coba tipe atau paket lain.",
++  ACTIVE_CHECKOUT_EXISTS:
++    "Kamu masih punya checkout aktif untuk tipe kamar ini. Selesaikan atau batalkan dulu.",
++  BOOKING_RESTRICTED: "Pemilik kos membatasi booking dari akunmu.",
++  PLAN_UNAVAILABLE: "Paket ini sudah tidak tersedia.",
++  NO_UPFRONT_PAYMENT:
++    "Paket ini tidak memiliki DP atau deposit, sehingga belum bisa dibayar lewat checkout.",
++  INVALID_PRICING: "Konfigurasi harga paket tidak valid. Hubungi pemilik kos.",
++  OWN_PROPERTY: "Kamu tidak bisa memesan kos milikmu sendiri.",
++  BOOKING_NOT_FOUND: "Booking tidak ditemukan.",
++  CANNOT_CANCEL_HERE:
++    "Pembayaran sudah berhasil. Pembatalan booking terkonfirmasi diproses lewat refund.",
++  HOLD_EXPIRED: "Waktu checkout sudah habis.",
++  BOOKING_NOT_PAYABLE: "Booking ini tidak bisa dibayar lagi.",
++  PAYMENT_PROVIDER_ERROR:
++    "Layanan pembayaran sedang bermasalah. Kamarmu masih ditahan, coba lagi sebentar.",
++  UNAUTHENTICATED: "Sesi habis. Silakan masuk lagi.",
++};
++export class CheckoutError extends Error {
++  constructor(readonly code: string) {
++    super(messages[code] ?? "Checkout gagal. Coba lagi.");
++  }
++}
++/** Business errors are matched by their stable code, never by free text. */
++export function toCheckoutError(input: unknown): CheckoutError {
++  const raw =
++    typeof input === "string"
++      ? input
++      : input instanceof Error
++        ? input.message
++        : "";
++  const code = Object.keys(messages).find((c) => raw.includes(c));
++  return new CheckoutError(code ?? "UNKNOWN");
++}
+diff --git a/apps/user-app/src/domain/models.ts b/apps/user-app/src/domain/models.ts
+index 3d8b7a7..d6ca8a9 100644
+--- a/apps/user-app/src/domain/models.ts
++++ b/apps/user-app/src/domain/models.ts
+@@ -94,6 +94,32 @@ export interface Conversation {
+   updated_at: string;
+   last_message: Message | null;
+ }
++export type BookingStatus =
++  | "DRAFT"
++  | "HELD"
++  | "PENDING_PAYMENT"
++  | "CONFIRMED"
++  | "ACTIVE"
++  | "COMPLETED"
++  | "CANCELLED";
++export interface Checkout {
++  bookingId: string;
++  bookingCode: string;
++  status: BookingStatus;
++  cancelReason: string | null;
++  propertyName: string;
++  roomTypeName: string;
++  planName: string;
++  rent: number;
++  downPayment: number;
++  securityDeposit: number;
++  payNow: number;
++  remainingRent: number;
++  holdExpiresAt: string | null;
++  serverNow: string;
++  paymentStatus: string | null;
++  redirectUrl: string | null;
++}
+ export const defaultQuery: SearchQuery = {
+   text: "",
+   durationUnit: "MONTH",
+diff --git a/apps/user-app/src/domain/paymentUrl.ts b/apps/user-app/src/domain/paymentUrl.ts
+new file mode 100644
+index 0000000..4a93360
+--- /dev/null
++++ b/apps/user-app/src/domain/paymentUrl.ts
+@@ -0,0 +1,12 @@
++/** Only Xendit's checkout pages may load inside the payment WebView. */
++export function isAllowedPaymentUrl(raw: string): boolean {
++  try {
++    const url = new URL(raw);
++    if (url.protocol === "about:") return raw === "about:blank";
++    if (url.protocol !== "https:") return false;
++    const host = url.hostname.toLowerCase();
++    return host === "xendit.co" || host.endsWith(".xendit.co");
++  } catch {
++    return false;
++  }
++}
+diff --git a/apps/user-app/src/domain/repositories/CheckoutRepository.ts b/apps/user-app/src/domain/repositories/CheckoutRepository.ts
+new file mode 100644
+index 0000000..0487820
+--- /dev/null
++++ b/apps/user-app/src/domain/repositories/CheckoutRepository.ts
+@@ -0,0 +1,10 @@
++import type { Checkout } from "../models";
++export interface CheckoutRepository {
++  /** Holds one unit and opens a payment session. Safe to repeat. */
++  start(planId: string): Promise<{ bookingId: string }>;
++  /** Server truth: status, hold deadline and server clock. */
++  get(bookingId: string): Promise<Checkout>;
++  cancel(bookingId: string): Promise<void>;
++  /** Mock mode only: stands in for the Xendit test-mode simulator. */
++  simulatePayment?(bookingId: string): Promise<void>;
++}
+diff --git a/apps/user-app/src/navigation/RootNavigator.tsx b/apps/user-app/src/navigation/RootNavigator.tsx
+index 2a6421f..68f7e02 100644
+--- a/apps/user-app/src/navigation/RootNavigator.tsx
++++ b/apps/user-app/src/navigation/RootNavigator.tsx
+@@ -9,6 +9,7 @@ import { RegisterScreen } from "../presentation/screens/RegisterScreen";
+ import { PropertyDetailScreen } from "../presentation/screens/PropertyDetailScreen";
+ import { RoomSelectionScreen } from "../presentation/screens/RoomSelectionScreen";
+ import { PlanSelectionScreen } from "../presentation/screens/PlanSelectionScreen";
++import { CheckoutScreen } from "../presentation/screens/CheckoutScreen";
+ import { ChatScreen } from "../presentation/screens/chat/ChatScreen";
+ import { EditProfileScreen } from "../presentation/screens/profile/EditProfileScreen";
+ import { ChangePasswordScreen } from "../presentation/screens/profile/ChangePasswordScreen";
+@@ -78,6 +79,11 @@ export function RootNavigator() {
+               component={PlanSelectionScreen}
+               options={{ title: "Pilih paket sewa" }}
+             />
++            <Stack.Screen
++              name="Checkout"
++              component={CheckoutScreen}
++              options={{ title: "Checkout" }}
++            />
+             <Stack.Screen
+               name="Chat"
+               component={ChatScreen}
+diff --git a/apps/user-app/src/navigation/types.ts b/apps/user-app/src/navigation/types.ts
+index 9d16baf..991dacc 100644
+--- a/apps/user-app/src/navigation/types.ts
++++ b/apps/user-app/src/navigation/types.ts
+@@ -19,6 +19,7 @@ export type RootStackParamList = {
+   PropertyDetail: { propertyId: string };
+   RoomSelection: { propertyId: string };
+   PlanSelection: { propertyId: string; roomId: string };
++  Checkout: { bookingId: string; planId: string };
+   Chat: { conversationId: string; propertyName: string };
+   EditProfile: undefined;
+   ChangePassword: undefined;
+diff --git a/apps/user-app/src/presentation/components/PaymentWebView.tsx b/apps/user-app/src/presentation/components/PaymentWebView.tsx
+new file mode 100644
+index 0000000..cee0cf3
+--- /dev/null
++++ b/apps/user-app/src/presentation/components/PaymentWebView.tsx
+@@ -0,0 +1,50 @@
++import { Modal, Pressable, StyleSheet, Text, View } from "react-native";
++import { WebView } from "react-native-webview";
++import { SafeAreaView } from "react-native-safe-area-context";
++import { isAllowedPaymentUrl } from "../../domain/paymentUrl";
++import { colors } from "../theme";
++/**
++ * Xendit's Invoice checkout page. What happens here never confirms a
++ * booking: the screen behind it re-reads server state after this closes.
++ */
++export function PaymentWebView({
++  url,
++  onClose,
++}: {
++  url: string;
++  onClose: () => void;
++}) {
++  return (
++    <Modal visible animationType="slide" onRequestClose={onClose}>
++      <SafeAreaView style={styles.safe}>
++        <View style={styles.header}>
++          <Text style={styles.title}>Pembayaran (uji coba)</Text>
++          <Pressable accessibilityRole="button" hitSlop={12} onPress={onClose}>
++            <Text style={styles.done}>Selesai</Text>
++          </Pressable>
++        </View>
++        <WebView
++          source={{ uri: url }}
++          originWhitelist={["https://*"]}
++          onShouldStartLoadWithRequest={(req) => isAllowedPaymentUrl(req.url)}
++          javaScriptEnabled
++          domStorageEnabled
++          style={{ flex: 1 }}
++        />
++      </SafeAreaView>
++    </Modal>
++  );
++}
++const styles = StyleSheet.create({
++  safe: { flex: 1, backgroundColor: "#fff" },
++  header: {
++    padding: 16,
++    flexDirection: "row",
++    justifyContent: "space-between",
++    alignItems: "center",
++    borderBottomWidth: 1,
++    borderBottomColor: colors.line,
++  },
++  title: { fontSize: 16, fontWeight: "700", color: colors.primary },
++  done: { fontSize: 14, fontWeight: "700", color: colors.primary },
++});
+diff --git a/apps/user-app/src/presentation/screens/CheckoutScreen.tsx b/apps/user-app/src/presentation/screens/CheckoutScreen.tsx
+new file mode 100644
+index 0000000..5f01bbc
+--- /dev/null
++++ b/apps/user-app/src/presentation/screens/CheckoutScreen.tsx
+@@ -0,0 +1,211 @@
++import { useEffect, useState } from "react";
++import { Alert, ScrollView, StyleSheet, Text, View } from "react-native";
++import { SafeAreaView } from "react-native-safe-area-context";
++import type { ScreenProps } from "../../navigation/types";
++import { useRepositories } from "../../providers/RepositoryProvider";
++import type { Checkout } from "../../domain/models";
++import { toCheckoutError } from "../../domain/checkoutErrors";
++import { Button, Status } from "../components/Primitives";
++import { PaymentWebView } from "../components/PaymentWebView";
++import { colors } from "../theme";
++import { rupiah } from "../format";
++const cancelText: Record<string, string> = {
++  HOLD_EXPIRED: "Waktu checkout habis, kamar dilepas kembali.",
++  USER_CANCELLED: "Checkout dibatalkan. Tidak ada pembayaran yang diproses.",
++  PAYMENT_EXPIRED: "Batas pembayaran berakhir, kamar dilepas kembali.",
++  LATE_PAYMENT:
++    "Pembayaran masuk setelah waktu habis. Kamar tidak diambil, dan dananya masuk proses pengembalian (simulasi).",
++};
++const pad = (n: number) => String(n).padStart(2, "0");
++export function CheckoutScreen({ route, navigation }: ScreenProps<"Checkout">) {
++  const { bookingId, planId } = route.params;
++  const { checkout, mode } = useRepositories();
++  const [data, setData] = useState<Checkout | null>(null);
++  const [error, setError] = useState<string | null>(null);
++  const [reloadToken, setReloadToken] = useState(0);
++  // serverOffsetMs = server clock minus device clock at the moment of the
++  // last fetch, so the countdown tracks the server's deadline, not the
++  // device's. nowMs only exists to force a re-render every second; the
++  // actual value it holds is unused elsewhere.
++  const [serverOffsetMs, setServerOffsetMs] = useState(0);
++  const [nowMs, setNowMs] = useState<number | null>(null);
++  const [busy, setBusy] = useState(false);
++  const [paying, setPaying] = useState(false);
++  const open = data?.status === "HELD" || data?.status === "PENDING_PAYMENT";
++  // Fetch on mount and whenever something bumps reloadToken.
++  useEffect(() => {
++    let active = true;
++    checkout.get(bookingId).then(
++      (next) => {
++        if (!active) return;
++        setData(next);
++        setError(null);
++        setServerOffsetMs(Date.parse(next.serverNow) - Date.now());
++        setNowMs(Date.now());
++      },
++      (e: unknown) => {
++        if (active) setError(toCheckoutError(e).message);
++      },
++    );
++    return () => {
++      active = false;
++    };
++  }, [checkout, bookingId, reloadToken]);
++  // While a hold is open: tick every second, and re-poll the server every
++  // 3 seconds so a payment confirmed elsewhere (e.g. Snap in the browser)
++  // shows up here without the user doing anything.
++  useEffect(() => {
++    if (!open) return;
++    const tick = setInterval(() => setNowMs(Date.now()), 1000);
++    const poll = setInterval(() => setReloadToken((t) => t + 1), 3000);
++    return () => {
++      clearInterval(tick);
++      clearInterval(poll);
++    };
++  }, [open]);
++  const remaining =
++    data?.holdExpiresAt && nowMs !== null
++      ? Math.max(0, Math.floor((Date.parse(data.holdExpiresAt) - (nowMs + serverOffsetMs)) / 1000))
++      : null;
++  // Countdown hit zero client-side: ask the server for the authoritative
++  // outcome instead of assuming HOLD_EXPIRED ourselves.
++  useEffect(() => {
++    if (!open || remaining !== 0) return;
++    const id = setTimeout(() => setReloadToken((t) => t + 1), 0);
++    return () => clearTimeout(id);
++  }, [open, remaining]);
++  async function run(action: () => Promise<void>) {
++    setBusy(true);
++    try {
++      await action();
++      setReloadToken((t) => t + 1);
++    } catch (e) {
++      setError(toCheckoutError(e).message);
++    } finally {
++      setBusy(false);
++    }
++  }
++  const confirmCancel = () =>
++    Alert.alert("Batalkan checkout?", "Kamar yang ditahan akan dilepas.", [
++      { text: "Lanjutkan bayar", style: "cancel" },
++      {
++        text: "Batalkan",
++        style: "destructive",
++        onPress: () => void run(() => checkout.cancel(bookingId)),
++      },
++    ]);
++  return (
++    <SafeAreaView edges={["bottom"]} style={styles.safe}>
++      <View style={styles.banner}>
++        <Text style={styles.bannerText}>DEMO / TEST MODE PAYMENT (XENDIT) · tanpa uang nyata</Text>
++      </View>
++      <ScrollView contentContainerStyle={styles.content}>
++        {!data ? (
++          <Status
++            loading={!error}
++            error={error}
++            onRetry={error ? () => setReloadToken((t) => t + 1) : undefined}
++          />
++        ) : (
++          <>
++            <Text style={styles.title}>{data.propertyName}</Text>
++            <Text style={styles.meta}>
++              {data.roomTypeName} · {data.planName} · {data.bookingCode}
++            </Text>
++            {open && remaining !== null && (
++              <View style={styles.timer}>
++                <Text style={styles.meta}>Kamar ditahan untukmu</Text>
++                <Text style={styles.time}>
++                  {pad(Math.floor(remaining / 60))}:{pad(remaining % 60)}
++                </Text>
++              </View>
++            )}
++            <View style={styles.cost}>
++              {[
++                ["Harga sewa", data.rent],
++                ["DP booking (bagian dari sewa)", data.downPayment],
++                ["Security deposit", data.securityDeposit],
++                ["Sisa sewa saat masuk", data.remainingRent],
++              ].map(([label, value]) => (
++                <View key={String(label)} style={styles.row}>
++                  <Text style={styles.meta}>{label}</Text>
++                  <Text style={styles.value}>{rupiah(Number(value))}</Text>
++                </View>
++              ))}
++              <View style={styles.row}>
++                <Text style={styles.title}>Bayar sekarang</Text>
++                <Text style={styles.title}>{rupiah(data.payNow)}</Text>
++              </View>
++            </View>
++            {data.status === "CONFIRMED" && (
++              <Text style={styles.ok}>
++                Pembayaran diterima dan booking terkonfirmasi. Unit sudah dialokasikan untukmu.
++              </Text>
++            )}
++            {data.status === "CANCELLED" && (
++              <Text style={styles.warn}>
++                {cancelText[data.cancelReason ?? ""] ?? "Booking dibatalkan."}
++              </Text>
++            )}
++            {open && data.paymentStatus === "PENDING" && (
++              <Text style={styles.meta}>
++                Menutup layar pembayaran tidak membatalkan checkout. Status diperbarui otomatis dari server.
++              </Text>
++            )}
++            {error && <Text style={styles.warn}>{error}</Text>}
++          </>
++        )}
++      </ScrollView>
++      {data && (
++        <View style={styles.footer}>
++          {open && (
++            <>
++              {mode === "mock" ? (
++                <Button
++                  title="Simulasikan pembayaran berhasil"
++                  disabled={busy}
++                  onPress={() => void run(async () => checkout.simulatePayment?.(bookingId))}
++                />
++              ) : data.redirectUrl ? (
++                <Button title="Bayar sekarang" disabled={busy} onPress={() => setPaying(true)} />
++              ) : (
++                <Button
++                  title="Muat sesi pembayaran"
++                  disabled={busy}
++                  onPress={() => void run(async () => void (await checkout.start(planId)))}
++                />
++              )}
++              <Button secondary title="Batalkan checkout" disabled={busy} onPress={confirmCancel} />
++            </>
++          )}
++          {!open && <Button title="Kembali ke beranda" onPress={() => navigation.popToTop()} />}
++        </View>
++      )}
++      {paying && data?.redirectUrl && (
++        <PaymentWebView
++          url={data.redirectUrl}
++          onClose={() => {
++            setPaying(false);
++            setReloadToken((t) => t + 1);
++          }}
++        />
++      )}
++    </SafeAreaView>
++  );
++}
++const styles = StyleSheet.create({
++  safe: { flex: 1, backgroundColor: "#fff" },
++  banner: { backgroundColor: colors.ink, paddingVertical: 8 },
++  bannerText: { color: "#fff", fontSize: 11, fontWeight: "700", textAlign: "center" },
++  content: { padding: 20, gap: 14, maxWidth: 600, width: "100%", alignSelf: "center" },
++  title: { fontSize: 14, fontWeight: "700", color: colors.ink },
++  meta: { fontSize: 11, color: colors.muted, lineHeight: 17 },
++  timer: { alignItems: "center", padding: 14, borderRadius: 12, backgroundColor: colors.soft, gap: 4 },
++  time: { fontSize: 30, fontWeight: "800", color: colors.primary },
++  cost: { gap: 12, padding: 16, borderRadius: 12, backgroundColor: colors.background },
++  row: { flexDirection: "row", justifyContent: "space-between", gap: 10 },
++  value: { fontSize: 11, fontWeight: "600", color: colors.primary },
++  ok: { fontSize: 12, color: colors.green, lineHeight: 18 },
++  warn: { fontSize: 12, color: colors.danger, lineHeight: 18 },
++  footer: { padding: 20, gap: 12, borderTopWidth: 1, borderTopColor: colors.line },
++});
+diff --git a/apps/user-app/src/presentation/screens/PlanSelectionScreen.tsx b/apps/user-app/src/presentation/screens/PlanSelectionScreen.tsx
+index dbda9c7..483a71c 100644
+--- a/apps/user-app/src/presentation/screens/PlanSelectionScreen.tsx
++++ b/apps/user-app/src/presentation/screens/PlanSelectionScreen.tsx
+@@ -4,16 +4,20 @@ import { SafeAreaView } from "react-native-safe-area-context";
+ import type { ScreenProps } from "../../navigation/types";
+ import { useRepositories } from "../../providers/RepositoryProvider";
+ import { summarizeCost } from "../../domain/pricing";
++import { toCheckoutError } from "../../domain/checkoutErrors";
+ import { useResource } from "../hooks/useResource";
+ import { Button, Status } from "../components/Primitives";
+-import { Sheet } from "../components/Sheet";
+ import { colors } from "../theme";
+ import { periodLabel, rupiah } from "../format";
+-export function PlanSelectionScreen({ route }: ScreenProps<"PlanSelection">) {
++export function PlanSelectionScreen({
++  route,
++  navigation,
++}: ScreenProps<"PlanSelection">) {
+   const { propertyId, roomId } = route.params;
+-  const { pricing, rooms } = useRepositories();
++  const { pricing, rooms, checkout } = useRepositories();
+   const [selected, setSelected] = useState<string | null>(null),
+-    [summary, setSummary] = useState(false);
++    [busy, setBusy] = useState(false),
++    [error, setError] = useState<string | null>(null);
+   const loader = useCallback(
+     async () => ({
+       plans: await pricing.listByRoom(roomId),
+@@ -122,38 +126,37 @@ export function PlanSelectionScreen({ route }: ScreenProps<"PlanSelection">) {
+           )}
+         </ScrollView>
+         <View style={styles.footer}>
+-          <Text style={styles.preview}>
+-            Pratinjau pilihan · belum membuat booking
+-          </Text>
+-          <Button
+-            title="Lihat ringkasan pilihan"
+-            disabled={!plan || !room || room.available < 1}
+-            onPress={() => setSummary(true)}
+-          />
+-        </View>
+-        <Sheet
+-          visible={summary}
+-          title="Pilihanmu sudah siap"
+-          onClose={() => setSummary(false)}
+-        >
+-          <Text style={styles.roomName}>
+-            {room?.name} · {plan?.name}
+-          </Text>
+-          <Text style={styles.terms}>
+-            Ini adalah akhir pratinjau. Kamar belum ditahan dan tidak ada
+-            pembayaran yang diproses. Checkout akan tersedia pada tahap
+-            berikutnya.
+-          </Text>
+-          {cost && (
+-            <Text style={styles.roomName}>
+-              Bayar saat booking: {rupiah(cost.payNow)}
++          {cost && cost.payNow <= 0 && (
++            <Text style={styles.preview}>
++              Paket ini tidak punya DP atau deposit, jadi belum bisa
++              dibayar lewat checkout.
++            </Text>
++          )}
++          {error && (
++            <Text style={[styles.preview, { color: colors.danger }]}>
++              {error}
+             </Text>
+           )}
+           <Button
+-            title="Kembali ke pilihan"
+-            onPress={() => setSummary(false)}
++            title={busy ? "Menahan kamar…" : "Lanjut ke checkout"}
++            disabled={
++              !plan || !room || room.available < 1 || busy || !cost || cost.payNow <= 0
++            }
++            onPress={async () => {
++              if (!plan) return;
++              setBusy(true);
++              setError(null);
++              try {
++                const { bookingId } = await checkout.start(plan.id);
++                navigation.navigate("Checkout", { bookingId, planId: plan.id });
++              } catch (e) {
++                setError(toCheckoutError(e).message);
++              } finally {
++                setBusy(false);
++              }
++            }}
+           />
+-        </Sheet>
++        </View>
+       </View>
+     </SafeAreaView>
+   );
+diff --git a/apps/user-app/src/presentation/screens/profile/EditProfileScreen.tsx b/apps/user-app/src/presentation/screens/profile/EditProfileScreen.tsx
+index 7c68db2..67f6e4a 100644
+--- a/apps/user-app/src/presentation/screens/profile/EditProfileScreen.tsx
++++ b/apps/user-app/src/presentation/screens/profile/EditProfileScreen.tsx
+@@ -1,4 +1,4 @@
+-import { useEffect, useState } from "react";
++import { useState } from "react";
+ import {
+   ActivityIndicator,
+   Alert,
+@@ -25,19 +25,23 @@ import { colors } from "../../theme";
+ export function EditProfileScreen({ navigation }: ScreenProps<"EditProfile">) {
+   const { profiles } = useRepositories();
+   const { profile, loading, error, reload, setProfile } = useProfile();
+-  const [form, setForm] = useState<ProfileUpdate | null>(null);
++  const [edited, setEdited] = useState<ProfileUpdate | null>(null);
+   const [errors, setErrors] = useState<FieldErrors<ProfileUpdate>>({});
+   const [saving, setSaving] = useState(false);
+   const [uploading, setUploading] = useState(false);
+-
+-  useEffect(() => {
+-    if (profile && !form)
+-      setForm({
+-        full_name: profile.full_name ?? "",
+-        phone: profile.phone ?? "",
+-        campus_or_company: profile.campus_or_company ?? "",
+-      });
+-  }, [profile, form]);
++  // Seeded from the loaded profile on first render, then overridden by
++  // whatever the user has typed. No effect needed: this is a pure
++  // derivation, not a subscription to an external system.
++  const form =
++    edited ??
++    (profile
++      ? {
++          full_name: profile.full_name ?? "",
++          phone: profile.phone ?? "",
++          campus_or_company: profile.campus_or_company ?? "",
++        }
++      : null);
++  const setForm = setEdited;
+ 
+   if (loading && !profile)
+     return (
+diff --git a/apps/user-app/src/providers/RepositoryProvider.tsx b/apps/user-app/src/providers/RepositoryProvider.tsx
+index ac5f8c4..56eede8 100644
+--- a/apps/user-app/src/providers/RepositoryProvider.tsx
++++ b/apps/user-app/src/providers/RepositoryProvider.tsx
+@@ -13,18 +13,21 @@ import type { PricingRepository } from "../domain/repositories/PricingRepository
+ import type { AuthRepository } from "../domain/repositories/AuthRepository";
+ import type { ProfileRepository } from "../domain/repositories/ProfileRepository";
+ import type { ChatRepository } from "../domain/repositories/ChatRepository";
++import type { CheckoutRepository } from "../domain/repositories/CheckoutRepository";
+ import { MockPropertyRepository } from "../data/mock/MockPropertyRepository";
+ import { MockRoomRepository } from "../data/mock/MockRoomRepository";
+ import { MockPricingRepository } from "../data/mock/MockPricingRepository";
+ import { MockAuthRepository } from "../data/mock/MockAuthRepository";
+ import { MockProfileRepository } from "../data/mock/MockProfileRepository";
+ import { MockChatRepository } from "../data/mock/MockChatRepository";
++import { MockCheckoutRepository } from "../data/mock/MockCheckoutRepository";
+ import { SupabasePropertyRepository } from "../data/supabase/SupabasePropertyRepository";
+ import { SupabaseRoomRepository } from "../data/supabase/SupabaseRoomRepository";
+ import { SupabasePricingRepository } from "../data/supabase/SupabasePricingRepository";
+ import { SupabaseAuthRepository } from "../data/supabase/SupabaseAuthRepository";
+ import { SupabaseProfileRepository } from "../data/supabase/SupabaseProfileRepository";
+ import { SupabaseChatRepository } from "../data/supabase/SupabaseChatRepository";
++import { SupabaseCheckoutRepository } from "../data/supabase/SupabaseCheckoutRepository";
+ export interface Repositories {
+   properties: PropertyRepository;
+   rooms: RoomRepository;
+@@ -32,6 +35,7 @@ export interface Repositories {
+   auth: AuthRepository;
+   profiles: ProfileRepository;
+   chat: ChatRepository;
++  checkout: CheckoutRepository;
+   mode: "mock" | "supabase";
+ }
+ const Context = createContext<Repositories | null>(null);
+@@ -56,6 +60,7 @@ function compose(): Repositories {
+       auth: new SupabaseAuthRepository(client),
+       profiles: new SupabaseProfileRepository(client),
+       chat: new SupabaseChatRepository(client),
++      checkout: new SupabaseCheckoutRepository(client),
+       mode: "supabase",
+     };
+   }
+@@ -67,6 +72,7 @@ function compose(): Repositories {
+     auth,
+     profiles: new MockProfileRepository(),
+     chat: new MockChatRepository(auth),
++    checkout: new MockCheckoutRepository(),
+     mode: "mock",
+   };
+ }
+diff --git a/docs/checkout-setup.md b/docs/checkout-setup.md
+new file mode 100644
+index 0000000..5387070
+--- /dev/null
++++ b/docs/checkout-setup.md
+@@ -0,0 +1,78 @@
++# Checkout & pembayaran (Xendit, Test Mode)
++
++## 1. Migrasi database
++Jalankan `supabase/migrations/202609270005_checkout.sql` di SQL Editor,
++setelah migrasi 1-4. Isinya fungsi `create_checkout`, `get_checkout`,
++`cancel_checkout` (dipanggil user lewat RPC/Edge Function) dan
++`attach_payment`, `apply_payment_event`, `expire_holds` (hanya
++`service_role`, dipanggil dari Edge Function).
++
++## 2. Akun dan key Xendit
++1. Daftar di `dashboard.xendit.co/register`, isi email dan jawab
++   pertanyaan dasar tentang "bisnis" (untuk demo akademik, isi apa
++   adanya). Kamu langsung masuk ke **Test Mode**, tanpa perlu upload
++   dokumen apa pun.
++2. Ambil **Secret API Key** (Test Mode) di **Settings → Developers →
++   API Keys**. Formatnya `xnd_development_...`.
++3. Ambil **Webhook Verification Token** di **Settings → Developers →
++   Webhooks**.
++
++## 3. Secret untuk Edge Functions
++Di **Project Settings → Edge Functions → Secrets** (atau `supabase secrets set`):
++
++```
++XENDIT_SECRET_KEY=xnd_development_xxxxx
++XENDIT_CALLBACK_TOKEN=isi-dari-dashboard-Xendit
++XENDIT_API_URL=https://api.xendit.co
++```
++`SUPABASE_URL` dan `SUPABASE_SERVICE_ROLE_KEY` sudah tersedia otomatis di
++setiap Edge Function, tidak perlu diisi manual.
++
++**Jangan** pernah menaruh `XENDIT_SECRET_KEY` di `.env` aplikasi
++(awalan `EXPO_PUBLIC_...`). Key itu hanya boleh ada di secret Edge Function.
++
++## 4. Deploy tiga Edge Function
++```
++supabase functions deploy create-payment
++supabase functions deploy cancel-payment
++supabase functions deploy xendit-webhook --no-verify-jwt
++```
++`--no-verify-jwt` khusus untuk webhook, karena yang memanggilnya adalah
++server Xendit, bukan pengguna yang login. Keasliannya diperiksa lewat
++header `x-callback-token`, bukan lewat sesi login.
++
++## 5. Daftarkan URL webhook di Xendit
++Ambil URL function: dashboard Supabase → **Edge Functions** →
++`xendit-webhook` → salin URL-nya. Paste di dashboard Xendit →
++**Settings → Developers → Webhooks**, bagian **Invoice Paid** (dan
++idealnya juga **Invoice Expired**), lalu Save.
++
++## 6. Jadwalkan pelepasan hold kedaluwarsa
++`expire_holds()` juga otomatis dipanggil setiap kali user membuka layar
++checkout, jadi sistem tetap benar walau tanpa jadwal. Untuk kebersihan data
++lebih cepat, atur **Database → Cron Jobs** memanggil:
++```sql
++select public.expire_holds();
++```
++setiap 1-5 menit.
++
++## 7. Uji coba
++Di halaman checkout Xendit (Test Mode), gunakan tombol simulasi
++pembayaran yang tersedia langsung di halaman itu — tidak perlu transfer
++bank sungguhan. Semua transaksi berlabel "DEMO / TEST MODE PAYMENT
++(XENDIT)" di aplikasi.
++
++## Catatan migrasi dari Midtrans
++Proyek ini semula dirancang dengan Midtrans Sandbox (lihat draf
++spesifikasi). Karena pendaftaran akun Midtrans menuntut dokumen bisnis
++(KTP/NPWP) bahkan untuk Sandbox, integrasi dipindah ke Xendit yang
++memberi akses Test Mode langsung setelah pendaftaran. Perbedaan teknis
++utama:
++- Verifikasi webhook: Midtrans memakai signature SHA512 per notifikasi;
++  Xendit memakai token statis di header `x-callback-token`, dicek sekali
++  oleh Edge Function sebelum payload diproses.
++- Idempotensi webhook: Midtrans tidak mengirim ID unik per notifikasi,
++  jadi kunci idempotensi disusun dari beberapa field; Xendit mengirim
++  header `webhook-id` yang unik per pengiriman, dipakai langsung.
++- ID transaksi provider tersedia sejak invoice dibuat (Xendit), tidak
++  perlu menunggu webhook pertama seperti pada Midtrans.
+diff --git a/supabase/functions/_shared/http.ts b/supabase/functions/_shared/http.ts
+new file mode 100644
+index 0000000..f82e385
+--- /dev/null
++++ b/supabase/functions/_shared/http.ts
+@@ -0,0 +1,26 @@
++export const cors = {
++  "Access-Control-Allow-Origin": "*",
++  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
++};
++export function json(body: unknown, status = 200): Response {
++  return new Response(JSON.stringify(body), {
++    status,
++    headers: { ...cors, "Content-Type": "application/json" },
++  });
++}
++export function env(name: string): string {
++  const value = Deno.env.get(name);
++  if (!value) throw new Error(`Missing secret: ${name}`);
++  return value;
++}
++/** Business errors raised by SQL functions carry a stable code in the message. */
++const known: Record<string, number> = {
++  SOLD_OUT: 409, ACTIVE_CHECKOUT_EXISTS: 409, BOOKING_RESTRICTED: 403,
++  PLAN_UNAVAILABLE: 404, NO_UPFRONT_PAYMENT: 422, INVALID_PRICING: 422,
++  OWN_PROPERTY: 403, BOOKING_NOT_FOUND: 404, CANNOT_CANCEL_HERE: 409,
++  HOLD_EXPIRED: 410, BOOKING_NOT_PAYABLE: 409,
++};
++export function businessError(message: string): Response | null {
++  const code = Object.keys(known).find((c) => message.includes(c));
++  return code ? json({ error: code }, known[code]) : null;
++}
+diff --git a/supabase/functions/_shared/xendit.ts b/supabase/functions/_shared/xendit.ts
+new file mode 100644
+index 0000000..00827df
+--- /dev/null
++++ b/supabase/functions/_shared/xendit.ts
+@@ -0,0 +1,22 @@
++// Pure helpers shared by the Edge Functions and the Node tests.
++export function basicAuth(secretKey: string): string {
++  return "Basic " + btoa(secretKey + ":");
++}
++function safeEqual(a: string, b: string): boolean {
++  if (a.length !== b.length) return false;
++  let diff = 0;
++  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
++  return diff === 0;
++}
++/**
++ * Xendit authenticates a webhook with a single shared token in the
++ * `x-callback-token` header (set once in the dashboard), not a
++ * per-request signature computed from the body like Midtrans.
++ */
++export function verifyCallbackToken(
++  headerValue: string | null,
++  expected: string,
++): boolean {
++  if (!headerValue || !expected) return false;
++  return safeEqual(headerValue, expected);
++}
+diff --git a/supabase/functions/cancel-payment/index.ts b/supabase/functions/cancel-payment/index.ts
+new file mode 100644
+index 0000000..adcf074
+--- /dev/null
++++ b/supabase/functions/cancel-payment/index.ts
+@@ -0,0 +1,40 @@
++// POST { booking_id } with the user's JWT. Expires the open Xendit
++// invoice when possible, then releases the hold. Closing the payment
++// page alone never cancels anything.
++import { createClient } from "npm:@supabase/supabase-js@2";
++import { basicAuth } from "../_shared/xendit.ts";
++import { businessError, cors, env, json } from "../_shared/http.ts";
++
++Deno.serve(async (req) => {
++  if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
++  if (req.method !== "POST") return json({ error: "METHOD_NOT_ALLOWED" }, 405);
++  try {
++    const url = env("SUPABASE_URL");
++    const user = createClient(url, env("SUPABASE_ANON_KEY"), {
++      global: { headers: { Authorization: req.headers.get("Authorization") ?? "" } },
++    });
++    const admin = createClient(url, env("SUPABASE_SERVICE_ROLE_KEY"));
++    const body = await req.json().catch(() => ({}));
++    if (typeof body.booking_id !== "string") return json({ error: "BAD_REQUEST" }, 400);
++    // Ownership check: get_checkout only returns the caller's own booking.
++    const check = await user.rpc("get_checkout", { p_booking_id: body.booking_id });
++    if (check.error) return businessError(check.error.message) ?? json({ error: "FAILED" }, 500);
++    if (check.data.payment_status === "SUCCESS") return json({ error: "CANNOT_CANCEL_HERE" }, 409);
++    const { data: open } = await admin.from("payments").select("provider_transaction_id")
++      .eq("booking_id", body.booking_id).eq("status", "PENDING");
++    const base = Deno.env.get("XENDIT_API_URL") ?? "https://api.xendit.co";
++    for (const p of open ?? []) {
++      if (!p.provider_transaction_id) continue;
++      await fetch(`${base}/v2/invoices/${encodeURIComponent(p.provider_transaction_id)}/expire!`, {
++        method: "POST",
++        headers: { Authorization: basicAuth(env("XENDIT_SECRET_KEY")) },
++      }).catch(() => undefined); // best effort; a later webhook reconciles anything missed
++    }
++    const { error } = await user.rpc("cancel_checkout", { p_booking_id: body.booking_id });
++    if (error) return businessError(error.message) ?? json({ error: "FAILED" }, 500);
++    return json({ ok: true });
++  } catch (e) {
++    console.error("cancel-payment failed", e instanceof Error ? e.message : "unknown");
++    return json({ error: "INTERNAL" }, 500);
++  }
++});
+diff --git a/supabase/functions/create-payment/index.ts b/supabase/functions/create-payment/index.ts
+new file mode 100644
+index 0000000..e0a4330
+--- /dev/null
++++ b/supabase/functions/create-payment/index.ts
+@@ -0,0 +1,79 @@
++// POST { plan_id, planned_move_in_date? } with the user's JWT.
++// Holds one unit (SQL, transactional), then opens a Xendit Invoice (Test
++// Mode) for the snapshot amount. Safe to call again: it returns the
++// existing pending invoice instead of creating a second one.
++import { createClient } from "npm:@supabase/supabase-js@2";
++import { basicAuth } from "../_shared/xendit.ts";
++import { businessError, cors, env, json } from "../_shared/http.ts";
++
++Deno.serve(async (req) => {
++  if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
++  if (req.method !== "POST") return json({ error: "METHOD_NOT_ALLOWED" }, 405);
++  try {
++    const auth = req.headers.get("Authorization") ?? "";
++    const url = env("SUPABASE_URL");
++    const user = createClient(url, env("SUPABASE_ANON_KEY"), {
++      global: { headers: { Authorization: auth } },
++    });
++    const admin = createClient(url, env("SUPABASE_SERVICE_ROLE_KEY"));
++    const { data: who } = await user.auth.getUser();
++    if (!who.user) return json({ error: "UNAUTHENTICATED" }, 401);
++    const body = await req.json().catch(() => ({}));
++    if (typeof body.plan_id !== "string") return json({ error: "BAD_REQUEST" }, 400);
++
++    const { data: bookingId, error } = await user.rpc("create_checkout", {
++      p_plan_id: body.plan_id,
++      p_move_in: body.planned_move_in_date ?? null,
++    });
++    if (error) return businessError(error.message) ?? json({ error: "CHECKOUT_FAILED" }, 500);
++
++    const { data: b } = await admin.from("bookings")
++      .select("booking_code,pay_now_snapshot,down_payment_snapshot,security_deposit_snapshot,room_type_name_snapshot,property_name_snapshot")
++      .eq("id", bookingId).single();
++    const { data: alloc } = await admin.from("inventory_allocations")
++      .select("expires_at").eq("booking_id", bookingId).is("released_at", null).single();
++    const { data: attempts } = await admin.from("payments")
++      .select("order_id,status,redirect_url").eq("booking_id", bookingId)
++      .order("created_at", { ascending: false });
++    const pending = attempts?.find((p) => p.status === "PENDING" && p.redirect_url);
++    if (pending) {
++      return json({ booking_id: bookingId, order_id: pending.order_id,
++        redirect_url: pending.redirect_url, hold_expires_at: alloc?.expires_at });
++    }
++
++    const orderId = `${b!.booking_code}-${(attempts?.length ?? 0) + 1}`;
++    const seconds = Math.max(60, Math.floor((new Date(alloc!.expires_at).getTime() - Date.now()) / 1000));
++    const invoiceRes = await fetch(
++      `${Deno.env.get("XENDIT_API_URL") ?? "https://api.xendit.co"}/v2/invoices`,
++      {
++        method: "POST",
++        headers: { "Content-Type": "application/json",
++          Authorization: basicAuth(env("XENDIT_SECRET_KEY")) },
++        body: JSON.stringify({
++          external_id: orderId,
++          amount: b!.pay_now_snapshot,
++          currency: "IDR",
++          payer_email: who.user.email,
++          description: `${b!.room_type_name_snapshot} · ${b!.property_name_snapshot} (DEMO)`,
++          invoice_duration: seconds,
++        }),
++      },
++    );
++    if (!invoiceRes.ok) {
++      // Hold stays valid: the app can retry with the same order id until it expires.
++      console.error("Xendit invoice error", invoiceRes.status);
++      return json({ error: "PAYMENT_PROVIDER_ERROR" }, 502);
++    }
++    const invoice = await invoiceRes.json();
++    const { error: attachError } = await admin.rpc("attach_payment", {
++      p_booking_id: bookingId, p_order_id: orderId,
++      p_redirect_url: invoice.invoice_url, p_provider_transaction_id: invoice.id,
++    });
++    if (attachError) return businessError(attachError.message) ?? json({ error: "ATTACH_FAILED" }, 500);
++    return json({ booking_id: bookingId, order_id: orderId,
++      redirect_url: invoice.invoice_url, hold_expires_at: alloc!.expires_at });
++  } catch (e) {
++    console.error("create-payment failed", e instanceof Error ? e.message : "unknown");
++    return json({ error: "INTERNAL" }, 500);
++  }
++});
+diff --git a/supabase/functions/xendit-webhook/index.ts b/supabase/functions/xendit-webhook/index.ts
+new file mode 100644
+index 0000000..22fbc64
+--- /dev/null
++++ b/supabase/functions/xendit-webhook/index.ts
+@@ -0,0 +1,40 @@
++// Xendit Invoice callback endpoint. Deploy WITHOUT JWT verification:
++//   supabase functions deploy xendit-webhook --no-verify-jwt
++// Authenticity comes from the x-callback-token header, not a user session.
++import { createClient } from "npm:@supabase/supabase-js@2";
++import { verifyCallbackToken } from "../_shared/xendit.ts";
++import { env, json } from "../_shared/http.ts";
++
++Deno.serve(async (req) => {
++  if (req.method !== "POST") return json({ error: "METHOD_NOT_ALLOWED" }, 405);
++  try {
++    if (!verifyCallbackToken(req.headers.get("x-callback-token"), env("XENDIT_CALLBACK_TOKEN"))) {
++      console.warn("Rejected notification: invalid callback token");
++      return json({ error: "INVALID_TOKEN" }, 401);
++    }
++    // Xendit's own delivery id: identical on a retried delivery, so it
++    // doubles as our idempotency key with no extra bookkeeping.
++    const webhookId = req.headers.get("webhook-id");
++    const n = await req.json().catch(() => null);
++    if (!n || typeof n.external_id !== "string" || typeof n.status !== "string")
++      return json({ error: "BAD_PAYLOAD" }, 400);
++    const admin = createClient(env("SUPABASE_URL"), env("SUPABASE_SERVICE_ROLE_KEY"));
++    const { data: result, error } = await admin.rpc("apply_payment_event", {
++      p_order_id: n.external_id,
++      p_event_key: webhookId ?? `${n.id}:${n.status}:${n.updated ?? ""}`,
++      p_status: n.status,
++      p_payment_method: n.payment_method ?? n.payment_channel ?? null,
++      p_amount: String(n.amount ?? n.paid_amount ?? ""),
++      p_provider_transaction_id: n.id ?? null,
++      p_payload: n,
++    });
++    if (error) {
++      console.error("apply_payment_event failed");
++      return json({ error: "RETRY" }, 500);
++    }
++    return json({ result });
++  } catch (e) {
++    console.error("xendit-webhook failed", e instanceof Error ? e.message : "unknown");
++    return json({ error: "RETRY" }, 500);
++  }
++});
+diff --git a/supabase/migrations/202609270005_checkout.sql b/supabase/migrations/202609270005_checkout.sql
+new file mode 100644
+index 0000000..a602482
+--- /dev/null
++++ b/supabase/migrations/202609270005_checkout.sql
+@@ -0,0 +1,267 @@
++-- ============================================================
++-- 23. CHECKOUT: HOLD -> PAYMENT (XENDIT INVOICE, TEST MODE) -> CONFIRMED
++--
++-- Clients still have no write grants on any table. Every state change
++-- goes through the functions below:
++--   create_checkout / cancel_checkout / get_checkout  -> authenticated user
++--   attach_payment / apply_payment_event / expire_holds -> service_role only
++--     (called by Edge Functions after the Xendit x-callback-token check)
++-- Inventory is locked per room type before capacity is checked, so two
++-- requests for the last unit serialize and exactly one gets the hold.
++-- ============================================================
++alter table public.payments add column redirect_url text;
++
++create function public.expire_holds() returns integer
++language plpgsql security definer set search_path='' as $$
++declare a record; n integer := 0;
++begin
++  for a in
++    select al.id, al.booking_id, al.room_type_id
++    from public.inventory_allocations al
++    where al.kind='HOLD' and al.released_at is null and al.expires_at <= now()
++    order by al.room_type_id, al.id
++    for update of al
++  loop
++    update public.inventory_allocations set released_at=now() where id=a.id;
++    update public.payments set status='EXPIRED', expired_at=now(), updated_at=now()
++      where booking_id=a.booking_id and status='PENDING';
++    update public.bookings
++      set status='CANCELLED', cancel_reason='HOLD_EXPIRED', cancelled_at=now()
++      where id=a.booking_id and status in ('HELD','PENDING_PAYMENT');
++    if found then
++      insert into public.booking_events(booking_id,from_status,to_status,reason)
++      values (a.booking_id,'HELD','CANCELLED','HOLD_EXPIRED');
++    end if;
++    n := n + 1;
++  end loop;
++  return n;
++end $$;
++
++create function public.create_checkout(p_plan_id uuid, p_move_in date default null)
++returns uuid
++language plpgsql security definer set search_path='' as $$
++declare
++  uid uuid := auth.uid();
++  pl public.pricing_plans; rt public.room_types; pr public.properties;
++  inv public.room_type_inventory; allocated bigint;
++  dp bigint; dep bigint; existing record; bid uuid;
++  hold_minutes constant integer := 15;
++begin
++  if uid is null then raise exception 'Not authenticated'; end if;
++  select * into pl from public.pricing_plans where id=p_plan_id and is_active;
++  if not found then raise exception 'PLAN_UNAVAILABLE'; end if;
++  select * into rt from public.room_types where id=pl.room_type_id and is_active;
++  if not found or not private.is_public_property(rt.property_id) then
++    raise exception 'PLAN_UNAVAILABLE'; end if;
++  select * into pr from public.properties where id=rt.property_id;
++  if exists (select 1 from public.user_restrictions
++             where owner_id=pr.owner_id and user_id=uid
++               and status='ACTIVE' and block_booking) then
++    raise exception 'BOOKING_RESTRICTED'; end if;
++  if pr.owner_id = uid then raise exception 'OWN_PROPERTY'; end if;
++
++  dp := case pl.down_payment_type when 'NONE' then 0 when 'FIXED' then pl.down_payment_value
++        else round(pl.price*pl.down_payment_value/100.0)::bigint end;
++  dep := case pl.security_deposit_type when 'NONE' then 0 when 'FIXED' then pl.security_deposit_value
++        else round(pl.price*pl.security_deposit_value/100.0)::bigint end;
++  if dp > pl.price then raise exception 'INVALID_PRICING'; end if;
++  if dp + dep <= 0 then raise exception 'NO_UPFRONT_PAYMENT'; end if;
++
++  -- Serialize everything that touches this room type's capacity.
++  perform 1 from public.room_type_inventory where room_type_id=rt.id for update;
++  perform public.expire_holds();
++
++  select b.id, b.pricing_plan_id into existing
++  from public.bookings b join public.inventory_allocations a on a.booking_id=b.id
++  where b.user_id=uid and b.room_type_id=rt.id and b.status in ('HELD','PENDING_PAYMENT')
++    and a.kind='HOLD' and a.released_at is null and a.expires_at > now();
++  if found then
++    if existing.pricing_plan_id = pl.id then return existing.id; end if;
++    raise exception 'ACTIVE_CHECKOUT_EXISTS';
++  end if;
++
++  select * into inv from public.room_type_inventory where room_type_id=rt.id;
++  select coalesce(sum(quantity),0) into allocated from public.inventory_allocations
++   where room_type_id=rt.id and released_at is null and (kind='RESERVED' or expires_at > now());
++  if inv.total is null
++     or inv.occupied+inv.cleaning+inv.maintenance+inv.inactive+allocated+1 > inv.total then
++    raise exception 'SOLD_OUT'; end if;
++
++  insert into public.bookings(booking_code,user_id,room_type_id,pricing_plan_id,status,
++    planned_move_in_date,property_name_snapshot,room_type_name_snapshot,pricing_plan_name_snapshot,
++    rent_price_snapshot,down_payment_snapshot,security_deposit_snapshot,pay_now_snapshot,
++    remaining_rent_snapshot,deposit_refundable_snapshot,deposit_terms_snapshot)
++  values ('KSK-'||upper(substr(replace(gen_random_uuid()::text,'-',''),1,10)),uid,rt.id,pl.id,'HELD',
++    p_move_in,pr.name,rt.name,pl.name,pl.price,dp,dep,dp+dep,pl.price-dp,
++    pl.deposit_refundable,pl.deposit_terms)
++  returning id into bid;
++  insert into public.inventory_allocations(booking_id,room_type_id,kind,quantity,expires_at)
++  values (bid,rt.id,'HOLD',1,now()+make_interval(mins=>hold_minutes));
++  insert into public.booking_events(booking_id,from_status,to_status,actor_id,reason)
++  values (bid,'DRAFT','HELD',uid,'CHECKOUT_STARTED');
++  return bid;
++end $$;
++
++create function public.get_checkout(p_booking_id uuid) returns jsonb
++language plpgsql security definer set search_path='' as $$
++declare b public.bookings; a public.inventory_allocations; p public.payments;
++begin
++  if auth.uid() is null then raise exception 'Not authenticated'; end if;
++  perform public.expire_holds();
++  select * into b from public.bookings where id=p_booking_id and user_id=auth.uid();
++  if not found then raise exception 'BOOKING_NOT_FOUND'; end if;
++  select * into a from public.inventory_allocations where booking_id=b.id order by created_at desc limit 1;
++  select * into p from public.payments where booking_id=b.id order by created_at desc limit 1;
++  return jsonb_build_object(
++    'booking_id',b.id,'booking_code',b.booking_code,'status',b.status,
++    'cancel_reason',b.cancel_reason,'property_name',b.property_name_snapshot,
++    'room_type_name',b.room_type_name_snapshot,'plan_name',b.pricing_plan_name_snapshot,
++    'rent',b.rent_price_snapshot,'down_payment',b.down_payment_snapshot,
++    'security_deposit',b.security_deposit_snapshot,'pay_now',b.pay_now_snapshot,
++    'remaining_rent',b.remaining_rent_snapshot,
++    'hold_expires_at',case when a.kind='HOLD' and a.released_at is null then a.expires_at end,
++    'server_now',now(),
++    'payment_status',p.status,'payment_method',p.payment_method,
++    'redirect_url',case when p.status='PENDING' then p.redirect_url end);
++end $$;
++
++create function public.cancel_checkout(p_booking_id uuid) returns void
++language plpgsql security definer set search_path='' as $$
++declare b public.bookings;
++begin
++  if auth.uid() is null then raise exception 'Not authenticated'; end if;
++  select * into b from public.bookings where id=p_booking_id and user_id=auth.uid() for update;
++  if not found then raise exception 'BOOKING_NOT_FOUND'; end if;
++  if b.status = 'CANCELLED' then return; end if;
++  if b.status not in ('HELD','PENDING_PAYMENT')
++     or exists (select 1 from public.payments where booking_id=b.id and status in ('SUCCESS','REFUND_PENDING','REFUNDED')) then
++    raise exception 'CANNOT_CANCEL_HERE'; end if;
++  perform 1 from public.room_type_inventory where room_type_id=b.room_type_id for update;
++  update public.inventory_allocations set released_at=now() where booking_id=b.id and released_at is null;
++  update public.payments set status='CANCELLED', updated_at=now() where booking_id=b.id and status='PENDING';
++  update public.bookings set status='CANCELLED', cancel_reason='USER_CANCELLED', cancelled_at=now() where id=b.id;
++  insert into public.booking_events(booking_id,from_status,to_status,actor_id,reason)
++  values (b.id,b.status,'CANCELLED',auth.uid(),'USER_CANCELLED');
++end $$;
++
++-- Idempotent per order_id (= Xendit external_id). Amount always comes from
++-- the booking snapshot, never from the provider response.
++create function public.attach_payment(
++  p_booking_id uuid, p_order_id text, p_redirect_url text, p_provider_transaction_id text default null)
++returns uuid
++language plpgsql security definer set search_path='' as $$
++declare b public.bookings; pid uuid;
++begin
++  select id into pid from public.payments where order_id=p_order_id;
++  if found then return pid; end if;
++  select * into b from public.bookings where id=p_booking_id for update;
++  if not found or b.status not in ('HELD','PENDING_PAYMENT') then raise exception 'BOOKING_NOT_PAYABLE'; end if;
++  if not exists (select 1 from public.inventory_allocations
++                 where booking_id=b.id and kind='HOLD' and released_at is null and expires_at>now()) then
++    raise exception 'HOLD_EXPIRED'; end if;
++  insert into public.payments(booking_id,order_id,provider_transaction_id,gross_amount,dp_amount,
++    deposit_amount,platform_fee,owner_amount,status,expired_at,redirect_url)
++  values (b.id,p_order_id,p_provider_transaction_id,b.pay_now_snapshot,b.down_payment_snapshot,
++    b.security_deposit_snapshot,0,b.down_payment_snapshot,'PENDING',
++    (select expires_at from public.inventory_allocations where booking_id=b.id and released_at is null limit 1),
++    p_redirect_url)
++  returning id into pid;
++  if b.status='HELD' then
++    update public.bookings set status='PENDING_PAYMENT' where id=b.id;
++    insert into public.booking_events(booking_id,from_status,to_status,reason)
++    values (b.id,'HELD','PENDING_PAYMENT','PAYMENT_SESSION_CREATED');
++  end if;
++  return pid;
++end $$;
++
++-- Applies a provider notification that the Edge Function has already
++-- signature-verified. Returns a result code; never lowers a final status.
++-- p_status is Xendit's invoice status (PAID/SETTLED/EXPIRED/PENDING),
++-- already read from a request whose x-callback-token the Edge Function
++-- has verified. p_event_key is Xendit's own "webhook-id" header, which
++-- is unique per delivery and repeats verbatim on a retried delivery.
++create function public.apply_payment_event(
++  p_order_id text, p_event_key text, p_status text,
++  p_payment_method text, p_amount text, p_provider_transaction_id text, p_payload jsonb)
++returns text
++language plpgsql security definer set search_path='' as $$
++declare p public.payments; b public.bookings; mapped public.payment_status; a public.inventory_allocations; ev uuid;
++begin
++  select * into p from public.payments where order_id=p_order_id for update;
++  if not found then
++    insert into public.payment_events(provider_event_key,provider_status,payload,signature_valid)
++    values (p_event_key,p_status,p_payload,true) on conflict do nothing;
++    return 'UNKNOWN_ORDER';
++  end if;
++  insert into public.payment_events(payment_id,provider_event_key,provider_status,payload,signature_valid)
++  values (p.id,p_event_key,p_status,p_payload,true)
++  on conflict (provider_event_key) do nothing returning id into ev;
++  if ev is null then return 'DUPLICATE'; end if;
++  if p_amount::numeric <> p.gross_amount then return 'AMOUNT_MISMATCH'; end if;
++
++  mapped := case
++    when p_status in ('PAID','SETTLED') then 'SUCCESS'
++    when p_status='PENDING' then 'PENDING'
++    when p_status='EXPIRED' then 'EXPIRED'
++    else null end;
++  if mapped is null then return 'UNKNOWN_STATUS'; end if;
++  if p_provider_transaction_id is not null then
++    update public.payments set provider_transaction_id=p_provider_transaction_id where id=p.id; end if;
++  update public.payments set provider_status=p_status,
++    payment_method=coalesce(p_payment_method,payment_method), updated_at=now() where id=p.id;
++  update public.payment_events set processed_at=now() where id=ev;
++
++  if p.status in ('SUCCESS','REFUND_PENDING','REFUNDED') then return 'IGNORED_FINAL'; end if;
++  select * into b from public.bookings where id=p.booking_id for update;
++
++  if mapped = 'SUCCESS' then
++    perform 1 from public.room_type_inventory where room_type_id=b.room_type_id for update;
++    select * into a from public.inventory_allocations
++     where booking_id=b.id and kind='HOLD' and released_at is null and expires_at>now();
++    if found and b.status in ('HELD','PENDING_PAYMENT') then
++      update public.payments set status='SUCCESS', paid_at=now(), updated_at=now() where id=p.id;
++      update public.inventory_allocations set kind='RESERVED', expires_at=null where id=a.id;
++      update public.bookings set status='CONFIRMED' where id=b.id;
++      insert into public.booking_events(booking_id,from_status,to_status,reason)
++      values (b.id,b.status,'CONFIRMED','PAYMENT_SUCCESS');
++      return 'CONFIRMED';
++    end if;
++    -- Late payment: never take capacity that may belong to someone else.
++    update public.payments set status='REFUND_PENDING', paid_at=now(), updated_at=now() where id=p.id;
++    if b.status in ('HELD','PENDING_PAYMENT') then
++      update public.inventory_allocations set released_at=now() where booking_id=b.id and released_at is null;
++      update public.bookings set status='CANCELLED', cancel_reason='LATE_PAYMENT', cancelled_at=now() where id=b.id;
++      insert into public.booking_events(booking_id,from_status,to_status,reason)
++      values (b.id,b.status,'CANCELLED','LATE_PAYMENT');
++    end if;
++    insert into public.refunds(payment_id,amount,reason,status,idempotency_key)
++    values (p.id,p.gross_amount,'Late payment after hold release','PENDING','late:'||p.id)
++    on conflict (idempotency_key) do nothing;
++    return 'LATE_PAYMENT_REFUND_PENDING';
++  end if;
++
++  if p.status <> 'PENDING' then return 'IGNORED_FINAL'; end if;
++  if mapped = 'PENDING' then return 'PENDING'; end if;
++  update public.payments set status=mapped, updated_at=now() where id=p.id;
++  if mapped = 'EXPIRED' and b.status in ('HELD','PENDING_PAYMENT') then
++    update public.inventory_allocations set released_at=now() where booking_id=b.id and released_at is null;
++    update public.bookings set status='CANCELLED', cancel_reason='PAYMENT_EXPIRED', cancelled_at=now() where id=b.id;
++    insert into public.booking_events(booking_id,from_status,to_status,reason)
++    values (b.id,b.status,'CANCELLED','PAYMENT_EXPIRED');
++  end if;
++  return mapped::text;
++end $$;
++
++revoke all on function public.expire_holds(), public.create_checkout(uuid,date),
++  public.get_checkout(uuid), public.cancel_checkout(uuid),
++  public.attach_payment(uuid,text,text,text),
++  public.apply_payment_event(text,text,text,text,text,text,jsonb)
++  from public, anon, authenticated;
++grant execute on function public.create_checkout(uuid,date), public.get_checkout(uuid),
++  public.cancel_checkout(uuid) to authenticated;
++do $$ begin
++  if exists (select 1 from pg_roles where rolname='service_role') then
++    grant execute on function public.expire_holds(), public.attach_payment(uuid,text,text,text),
++      public.apply_payment_event(text,text,text,text,text,text,jsonb) to service_role;
++  end if;
++end $$;
+diff --git a/tests/checkout.test.mjs b/tests/checkout.test.mjs
+new file mode 100644
+index 0000000..6c47921
+--- /dev/null
++++ b/tests/checkout.test.mjs
+@@ -0,0 +1,184 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { readFile, readdir } from "node:fs/promises";
++import { PGlite } from "@electric-sql/pglite";
++import { verifyCallbackToken } from "../supabase/functions/_shared/xendit.ts";
++const id = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
++const ROOM = id(200);
++
++test("Xendit callback token check", () => {
++  assert.equal(verifyCallbackToken("secret-token", "secret-token"), true);
++  assert.equal(verifyCallbackToken("wrong-token", "secret-token"), false);
++  assert.equal(verifyCallbackToken(null, "secret-token"), false);
++  assert.equal(verifyCallbackToken("secret-token", ""), false);
++  assert.equal(verifyCallbackToken("short", "secret-token"), false);
++});
++
++test("Checkout: hold, payment, webhook, expiry, late payment and permissions", async (t) => {
++  const db = new PGlite();
++  try {
++    await db.exec(`create role anon;create role authenticated;create role service_role;create schema auth;
++   create table auth.users(id uuid primary key,email text);
++   create function auth.uid() returns uuid language sql stable as $$select nullif(current_setting('request.jwt.claim.sub',true),'')::uuid$$;
++   grant usage on schema auth to anon,authenticated,service_role;grant execute on function auth.uid() to anon,authenticated;`);
++    for (const f of (await readdir("supabase/migrations")).sort())
++      await db.exec(await readFile(`supabase/migrations/${f}`, "utf8"));
++    await db.exec(await readFile("supabase/seed.sql", "utf8"));
++    const as = async (role, who = "") =>
++      db.exec(`reset role;set role ${role};select set_config('request.jwt.claim.sub','${who}',false);`);
++    const rows = async (sql) => (await db.query(sql)).rows;
++    for (const n of [7101, 7102, 7103, 7104])
++      await db.exec(`insert into auth.users(id,email) values ('${id(n)}','u${n}@kosku.invalid')`);
++    const plans = await rows(`select id,
++      case down_payment_type when 'NONE' then 0 when 'FIXED' then down_payment_value else round(price*down_payment_value/100.0) end
++      + case security_deposit_type when 'NONE' then 0 when 'FIXED' then security_deposit_value else round(price*security_deposit_value/100.0) end as pay_now
++      from public.pricing_plans where room_type_id='${ROOM}' and is_active order by id`);
++    const paying = plans.filter((p) => Number(p.pay_now) > 0);
++    assert.ok(paying.length >= 2, "seed needs two paying plans on the test room");
++    const [planA, planB] = paying;
++    const checkout = async (user, plan) => {
++      await as("authenticated", id(user));
++      return (await rows(`select public.create_checkout('${plan}') b`))[0].b;
++    };
++    const status = async (bid) => {
++      await as("postgres");
++      return (await rows(`select status,cancel_reason from public.bookings where id='${bid}'`))[0];
++    };
++    // Mirrors what the xendit-webhook Edge Function passes to apply_payment_event
++    // after it has already verified the x-callback-token header.
++    const event = async (order, webhookId, xenditStatus, amount, xenditInvoiceId = "inv-x") => {
++      await as("service_role");
++      return (
++        await rows(
++          `select public.apply_payment_event('${order}','${webhookId}','${xenditStatus}','bank_transfer','${amount}','${xenditInvoiceId}','{}'::jsonb) r`,
++        )
++      )[0].r;
++    };
++    const attach = async (bid, order, invoiceId = `inv-${order}`) => {
++      await as("service_role");
++      return db.exec(
++        `select public.attach_payment('${bid}','${order}','https://checkout.xendit.co/web/${order}','${invoiceId}')`,
++      );
++    };
++    const setAvailable = async (n) => {
++      await as("postgres");
++      await db.exec(`update public.room_type_inventory set total=occupied+cleaning+maintenance+inactive+${n} where room_type_id='${ROOM}'`);
++    };
++
++    await t.test("Hold is created with server-side snapshot, idempotent for same plan, blocked for another", async () => {
++      await setAvailable(3);
++      const b1 = await checkout(7101, planA.id);
++      assert.equal(await checkout(7101, planA.id), b1);
++      await assert.rejects(checkout(7101, planB.id), /ACTIVE_CHECKOUT_EXISTS/);
++      await as("authenticated", id(7101));
++      const info = (await rows(`select public.get_checkout('${b1}') j`))[0].j;
++      assert.equal(info.status, "HELD");
++      assert.equal(Number(info.pay_now), Number(planA.pay_now));
++      const secs = (new Date(info.hold_expires_at) - new Date(info.server_now)) / 1000;
++      assert.ok(secs > 14 * 60 && secs <= 15 * 60, `hold seconds ${secs}`);
++      await as("authenticated", id(7102));
++      await assert.rejects(db.query(`select public.get_checkout('${b1}')`), /BOOKING_NOT_FOUND/);
++      await as("authenticated", id(7101));
++      await db.exec(`select public.cancel_checkout('${b1}')`);
++    });
++
++    await t.test("Last unit: exactly one of two users gets the hold", async () => {
++      await setAvailable(1);
++      const winner = await checkout(7101, planA.id);
++      await assert.rejects(checkout(7102, planA.id), /SOLD_OUT/);
++      assert.equal((await status(winner)).status, "HELD");
++      await as("authenticated", id(7101));
++      await db.exec(`select public.cancel_checkout('${winner}')`);
++      const next = await checkout(7102, planA.id);
++      assert.equal((await status(next)).status, "HELD");
++      await as("authenticated", id(7102));
++      await db.exec(`select public.cancel_checkout('${next}')`);
++      assert.equal((await status(next)).cancel_reason, "USER_CANCELLED");
++    });
++
++    await t.test("Clients cannot call payment or webhook functions", async () => {
++      const b = await checkout(7101, planA.id);
++      await as("authenticated", id(7101));
++      await assert.rejects(db.query(`select public.attach_payment('${b}','X-1','https://x')`), /permission denied/);
++      await assert.rejects(
++        db.query(`select public.apply_payment_event('X-1','k','PAID',null,'1','t','{}'::jsonb)`),
++        /permission denied/,
++      );
++      await assert.rejects(db.query(`select public.expire_holds()`), /permission denied/);
++      await as("authenticated", id(7101));
++      await db.exec(`select public.cancel_checkout('${b}')`);
++    });
++
++    await t.test("Paid confirms once; duplicates, pending and wrong amounts change nothing", async () => {
++      const b = await checkout(7101, planA.id);
++      await attach(b, "ORD-A");
++      await attach(b, "ORD-A");
++      assert.equal((await status(b)).status, "PENDING_PAYMENT");
++      const amount = String(planA.pay_now);
++      assert.equal(await event("ORD-A", "wh-0", "PAID", "1"), "AMOUNT_MISMATCH");
++      assert.equal((await status(b)).status, "PENDING_PAYMENT");
++      assert.equal(await event("ORD-A", "wh-1", "PENDING", amount), "PENDING");
++      assert.equal(await event("ORD-A", "wh-2", "PAID", amount), "CONFIRMED");
++      assert.equal(await event("ORD-A", "wh-2", "PAID", amount), "DUPLICATE");
++      assert.equal(await event("ORD-A", "wh-3", "PENDING", amount), "IGNORED_FINAL");
++      assert.equal(await event("ORD-A", "wh-4", "EXPIRED", amount), "IGNORED_FINAL");
++      await as("postgres");
++      assert.equal((await status(b)).status, "CONFIRMED");
++      const alloc = (await rows(`select kind,expires_at from public.inventory_allocations where booking_id='${b}'`))[0];
++      assert.equal(alloc.kind, "RESERVED");
++      assert.equal(alloc.expires_at, null);
++      assert.equal((await rows(`select status,provider_transaction_id from public.payments where order_id='ORD-A'`))[0].status, "SUCCESS");
++      await as("authenticated", id(7101));
++      await assert.rejects(db.query(`select public.cancel_checkout('${b}')`), /CANNOT_CANCEL_HERE/);
++      await as("service_role");
++      assert.equal(await event("NOPE", "wh-5", "PAID", "1"), "UNKNOWN_ORDER");
++    });
++
++    await t.test("Unrecognized status is reported rather than silently applied", async () => {
++      await setAvailable(2);
++      const b = await checkout(7103, planA.id);
++      await attach(b, "ORD-U");
++      assert.equal(await event("ORD-U", "wh-u1", "SOMETHING_NEW", String(planA.pay_now)), "UNKNOWN_STATUS");
++      assert.equal((await status(b)).status, "PENDING_PAYMENT");
++      await as("authenticated", id(7103));
++      await db.exec(`select public.cancel_checkout('${b}')`);
++    });
++
++    await t.test("Expired hold cancels booking; late success is refunded and never takes the unit", async () => {
++      await setAvailable(3);
++      const b = await checkout(7104, planA.id);
++      await attach(b, "ORD-L");
++      await as("postgres");
++      await db.exec(`update public.inventory_allocations set expires_at=now()-interval '1 minute' where booking_id='${b}'`);
++      await as("authenticated", id(7104));
++      const info = (await rows(`select public.get_checkout('${b}') j`))[0].j;
++      assert.equal(info.status, "CANCELLED");
++      assert.equal(info.cancel_reason, "HOLD_EXPIRED");
++      assert.equal(info.payment_status, "EXPIRED");
++      assert.equal(info.hold_expires_at, null);
++      assert.equal(await event("ORD-L", "wh-l1", "PAID", String(planA.pay_now)), "LATE_PAYMENT_REFUND_PENDING");
++      await as("postgres");
++      assert.equal((await status(b)).status, "CANCELLED");
++      assert.equal((await rows(`select status from public.payments where order_id='ORD-L'`))[0].status, "REFUND_PENDING");
++      const refund = (await rows(`select r.amount,r.status from public.refunds r join public.payments p on p.id=r.payment_id where p.order_id='ORD-L'`))[0];
++      assert.equal(Number(refund.amount), Number(planA.pay_now));
++      assert.equal(refund.status, "PENDING");
++    });
++
++    await t.test("Restricted users, zero upfront plans and unavailable plans are rejected", async () => {
++      await as("postgres");
++      const owner = (await rows(`select p.owner_id from public.properties p join public.room_types r on r.property_id=p.id where r.id='${ROOM}'`))[0].owner_id;
++      await db.exec(`insert into public.user_restrictions(owner_id,user_id,block_booking,reason) values ('${owner}','${id(7102)}',true,'SPAM')`);
++      await assert.rejects(checkout(7102, planA.id), /BOOKING_RESTRICTED/);
++      const free = plans.find((p) => Number(p.pay_now) > 0);
++      await as("postgres");
++      await db.exec(`update public.pricing_plans set down_payment_type='NONE',down_payment_value=0,security_deposit_type='NONE',security_deposit_value=0 where id='${free.id}'`);
++      await assert.rejects(checkout(7103, free.id), /NO_UPFRONT_PAYMENT/);
++      await assert.rejects(checkout(7103, id(999999)), /PLAN_UNAVAILABLE/);
++      await as("anon");
++      await assert.rejects(db.query(`select public.create_checkout('${planB.id}')`), /permission denied/);
++    });
++  } finally {
++    await db.close();
++  }
++});
+diff --git a/tests/checkoutClient.test.mjs b/tests/checkoutClient.test.mjs
+new file mode 100644
+index 0000000..1687d97
+--- /dev/null
++++ b/tests/checkoutClient.test.mjs
+@@ -0,0 +1,54 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { MockCheckoutRepository } from "../apps/user-app/src/data/mock/MockCheckoutRepository.ts";
++import { isAllowedPaymentUrl } from "../apps/user-app/src/domain/paymentUrl.ts";
++import { parseCheckout } from "../apps/user-app/src/data/supabase/SupabaseCheckoutRepository.ts";
++
++test("Mock checkout: hold, sold out, simulate, cancel, expiry", async () => {
++  let clock = 1_000_000;
++  const repo = new MockCheckoutRepository(() => clock);
++  const room = (await import("../apps/user-app/src/data/mock/fixtures.ts")).mockRooms.find(
++    (r) => r.plans.some((p) => p.down_payment + p.security_deposit > 0),
++  );
++  const plan = room.plans.find((p) => p.down_payment + p.security_deposit > 0);
++  const { bookingId } = await repo.start(plan.id);
++  const c1 = await repo.get(bookingId);
++  assert.equal(c1.status, "PENDING_PAYMENT");
++  assert.equal(c1.payNow, plan.down_payment + plan.security_deposit);
++  assert.equal((await repo.start(plan.id)).bookingId, bookingId);
++  await assert.rejects(repo.cancel("nope"), { code: "BOOKING_NOT_FOUND" });
++  await repo.simulatePayment(bookingId);
++  assert.equal((await repo.get(bookingId)).status, "CONFIRMED");
++  await assert.rejects(repo.cancel(bookingId), { code: "CANNOT_CANCEL_HERE" });
++  const other = await repo.start(plan.id);
++  clock += 16 * 60 * 1000;
++  const expired = await repo.get(other.bookingId);
++  assert.equal(expired.status, "CANCELLED");
++  assert.equal(expired.cancelReason, "HOLD_EXPIRED");
++});
++
++test("Payment WebView only allows Xendit domains", () => {
++  assert.equal(isAllowedPaymentUrl("https://checkout.xendit.co/web/x"), true);
++  assert.equal(isAllowedPaymentUrl("https://checkout-staging.xendit.co/web/x"), true);
++  assert.equal(isAllowedPaymentUrl("about:blank"), true);
++  assert.equal(isAllowedPaymentUrl("https://evil-xendit.co/x"), false);
++  assert.equal(isAllowedPaymentUrl("http://checkout.xendit.co/x"), false);
++  assert.equal(isAllowedPaymentUrl("javascript:alert(1)"), false);
++  assert.equal(isAllowedPaymentUrl("not a url"), false);
++});
++
++test("parseCheckout validates the RPC shape defensively", () => {
++  const good = {
++    booking_id: "b1", booking_code: "KSK-1", status: "HELD", cancel_reason: null,
++    property_name: "P", room_type_name: "R", plan_name: "Bulanan",
++    rent: "1500000", down_payment: 500000, security_deposit: 500000,
++    pay_now: 1000000, remaining_rent: 1000000, hold_expires_at: "2026-01-01T00:00:00Z",
++    server_now: "2026-01-01T00:00:00Z", payment_status: null, redirect_url: null,
++  };
++  const parsed = parseCheckout(good);
++  assert.equal(parsed.rent, 1500000);
++  assert.equal(parsed.status, "HELD");
++  assert.throws(() => parseCheckout({ ...good, status: "BOGUS" }), /status/);
++  assert.throws(() => parseCheckout({ ...good, rent: "abc" }), /rent/);
++  assert.throws(() => parseCheckout(null), /status/);
++});

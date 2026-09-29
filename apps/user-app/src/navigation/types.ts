@@ -19,6 +19,7 @@ export type RootStackParamList = {
   PropertyDetail: { propertyId: string };
   RoomSelection: { propertyId: string };
   PlanSelection: { propertyId: string; roomId: string };
+  Checkout: { bookingId: string; planId: string };
   Chat: { conversationId: string; propertyName: string };
   EditProfile: undefined;
   ChangePassword: undefined;

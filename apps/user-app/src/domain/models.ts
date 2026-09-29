@@ -94,6 +94,32 @@ export interface Conversation {
   updated_at: string;
   last_message: Message | null;
 }
+export type BookingStatus =
+  | "DRAFT"
+  | "HELD"
+  | "PENDING_PAYMENT"
+  | "CONFIRMED"
+  | "ACTIVE"
+  | "COMPLETED"
+  | "CANCELLED";
+export interface Checkout {
+  bookingId: string;
+  bookingCode: string;
+  status: BookingStatus;
+  cancelReason: string | null;
+  propertyName: string;
+  roomTypeName: string;
+  planName: string;
+  rent: number;
+  downPayment: number;
+  securityDeposit: number;
+  payNow: number;
+  remainingRent: number;
+  holdExpiresAt: string | null;
+  serverNow: string;
+  paymentStatus: string | null;
+  redirectUrl: string | null;
+}
 export const defaultQuery: SearchQuery = {
   text: "",
   durationUnit: "MONTH",

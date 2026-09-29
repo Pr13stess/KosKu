@@ -13,18 +13,21 @@ import type { PricingRepository } from "../domain/repositories/PricingRepository
 import type { AuthRepository } from "../domain/repositories/AuthRepository";
 import type { ProfileRepository } from "../domain/repositories/ProfileRepository";
 import type { ChatRepository } from "../domain/repositories/ChatRepository";
+import type { CheckoutRepository } from "../domain/repositories/CheckoutRepository";
 import { MockPropertyRepository } from "../data/mock/MockPropertyRepository";
 import { MockRoomRepository } from "../data/mock/MockRoomRepository";
 import { MockPricingRepository } from "../data/mock/MockPricingRepository";
 import { MockAuthRepository } from "../data/mock/MockAuthRepository";
 import { MockProfileRepository } from "../data/mock/MockProfileRepository";
 import { MockChatRepository } from "../data/mock/MockChatRepository";
+import { MockCheckoutRepository } from "../data/mock/MockCheckoutRepository";
 import { SupabasePropertyRepository } from "../data/supabase/SupabasePropertyRepository";
 import { SupabaseRoomRepository } from "../data/supabase/SupabaseRoomRepository";
 import { SupabasePricingRepository } from "../data/supabase/SupabasePricingRepository";
 import { SupabaseAuthRepository } from "../data/supabase/SupabaseAuthRepository";
 import { SupabaseProfileRepository } from "../data/supabase/SupabaseProfileRepository";
 import { SupabaseChatRepository } from "../data/supabase/SupabaseChatRepository";
+import { SupabaseCheckoutRepository } from "../data/supabase/SupabaseCheckoutRepository";
 export interface Repositories {
   properties: PropertyRepository;
   rooms: RoomRepository;
@@ -32,6 +35,7 @@ export interface Repositories {
   auth: AuthRepository;
   profiles: ProfileRepository;
   chat: ChatRepository;
+  checkout: CheckoutRepository;
   mode: "mock" | "supabase";
 }
 const Context = createContext<Repositories | null>(null);
@@ -56,6 +60,7 @@ function compose(): Repositories {
       auth: new SupabaseAuthRepository(client),
       profiles: new SupabaseProfileRepository(client),
       chat: new SupabaseChatRepository(client),
+      checkout: new SupabaseCheckoutRepository(client),
       mode: "supabase",
     };
   }
@@ -67,6 +72,7 @@ function compose(): Repositories {
     auth,
     profiles: new MockProfileRepository(),
     chat: new MockChatRepository(auth),
+    checkout: new MockCheckoutRepository(),
     mode: "mock",
   };
 }

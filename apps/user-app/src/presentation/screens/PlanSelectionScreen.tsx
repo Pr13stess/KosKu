@@ -4,16 +4,20 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import type { ScreenProps } from "../../navigation/types";
 import { useRepositories } from "../../providers/RepositoryProvider";
 import { summarizeCost } from "../../domain/pricing";
+import { toCheckoutError } from "../../domain/checkoutErrors";
 import { useResource } from "../hooks/useResource";
 import { Button, Status } from "../components/Primitives";
-import { Sheet } from "../components/Sheet";
 import { colors } from "../theme";
 import { periodLabel, rupiah } from "../format";
-export function PlanSelectionScreen({ route }: ScreenProps<"PlanSelection">) {
+export function PlanSelectionScreen({
+  route,
+  navigation,
+}: ScreenProps<"PlanSelection">) {
   const { propertyId, roomId } = route.params;
-  const { pricing, rooms } = useRepositories();
+  const { pricing, rooms, checkout } = useRepositories();
   const [selected, setSelected] = useState<string | null>(null),
-    [summary, setSummary] = useState(false);
+    [busy, setBusy] = useState(false),
+    [error, setError] = useState<string | null>(null);
   const loader = useCallback(
     async () => ({
       plans: await pricing.listByRoom(roomId),
@@ -122,38 +126,37 @@ export function PlanSelectionScreen({ route }: ScreenProps<"PlanSelection">) {
           )}
         </ScrollView>
         <View style={styles.footer}>
-          <Text style={styles.preview}>
-            Pratinjau pilihan · belum membuat booking
-          </Text>
-          <Button
-            title="Lihat ringkasan pilihan"
-            disabled={!plan || !room || room.available < 1}
-            onPress={() => setSummary(true)}
-          />
-        </View>
-        <Sheet
-          visible={summary}
-          title="Pilihanmu sudah siap"
-          onClose={() => setSummary(false)}
-        >
-          <Text style={styles.roomName}>
-            {room?.name} · {plan?.name}
-          </Text>
-          <Text style={styles.terms}>
-            Ini adalah akhir pratinjau. Kamar belum ditahan dan tidak ada
-            pembayaran yang diproses. Checkout akan tersedia pada tahap
-            berikutnya.
-          </Text>
-          {cost && (
-            <Text style={styles.roomName}>
-              Bayar saat booking: {rupiah(cost.payNow)}
+          {cost && cost.payNow <= 0 && (
+            <Text style={styles.preview}>
+              Paket ini tidak punya DP atau deposit, jadi belum bisa
+              dibayar lewat checkout.
+            </Text>
+          )}
+          {error && (
+            <Text style={[styles.preview, { color: colors.danger }]}>
+              {error}
             </Text>
           )}
           <Button
-            title="Kembali ke pilihan"
-            onPress={() => setSummary(false)}
+            title={busy ? "Menahan kamar…" : "Lanjut ke checkout"}
+            disabled={
+              !plan || !room || room.available < 1 || busy || !cost || cost.payNow <= 0
+            }
+            onPress={async () => {
+              if (!plan) return;
+              setBusy(true);
+              setError(null);
+              try {
+                const { bookingId } = await checkout.start(plan.id);
+                navigation.navigate("Checkout", { bookingId, planId: plan.id });
+              } catch (e) {
+                setError(toCheckoutError(e).message);
+              } finally {
+                setBusy(false);
+              }
+            }}
           />
-        </Sheet>
+        </View>
       </View>
     </SafeAreaView>
   );

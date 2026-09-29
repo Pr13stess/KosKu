@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -25,19 +25,23 @@ import { colors } from "../../theme";
 export function EditProfileScreen({ navigation }: ScreenProps<"EditProfile">) {
   const { profiles } = useRepositories();
   const { profile, loading, error, reload, setProfile } = useProfile();
-  const [form, setForm] = useState<ProfileUpdate | null>(null);
+  const [edited, setEdited] = useState<ProfileUpdate | null>(null);
   const [errors, setErrors] = useState<FieldErrors<ProfileUpdate>>({});
   const [saving, setSaving] = useState(false);
   const [uploading, setUploading] = useState(false);
-
-  useEffect(() => {
-    if (profile && !form)
-      setForm({
-        full_name: profile.full_name ?? "",
-        phone: profile.phone ?? "",
-        campus_or_company: profile.campus_or_company ?? "",
-      });
-  }, [profile, form]);
+  // Seeded from the loaded profile on first render, then overridden by
+  // whatever the user has typed. No effect needed: this is a pure
+  // derivation, not a subscription to an external system.
+  const form =
+    edited ??
+    (profile
+      ? {
+          full_name: profile.full_name ?? "",
+          phone: profile.phone ?? "",
+          campus_or_company: profile.campus_or_company ?? "",
+        }
+      : null);
+  const setForm = setEdited;
 
   if (loading && !profile)
     return (
