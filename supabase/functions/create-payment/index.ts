@@ -25,7 +25,10 @@ Deno.serve(async (req) => {
       p_plan_id: body.plan_id,
       p_move_in: body.planned_move_in_date ?? null,
     });
-    if (error) return businessError(error.message) ?? json({ error: "CHECKOUT_FAILED" }, 500);
+    if (error) {
+      console.error("create_checkout RPC failed:", error.message);
+      return businessError(error.message) ?? json({ error: "CHECKOUT_FAILED" }, 500);
+    }
 
     const { data: b } = await admin.from("bookings")
       .select("booking_code,pay_now_snapshot,down_payment_snapshot,security_deposit_snapshot,room_type_name_snapshot,property_name_snapshot")
@@ -61,7 +64,8 @@ Deno.serve(async (req) => {
     );
     if (!invoiceRes.ok) {
       // Hold stays valid: the app can retry with the same order id until it expires.
-      console.error("Xendit invoice error", invoiceRes.status);
+      const detail = await invoiceRes.text().catch(() => "");
+      console.error("Xendit invoice error", invoiceRes.status, detail);
       return json({ error: "PAYMENT_PROVIDER_ERROR" }, 502);
     }
     const invoice = await invoiceRes.json();
@@ -69,7 +73,10 @@ Deno.serve(async (req) => {
       p_booking_id: bookingId, p_order_id: orderId,
       p_redirect_url: invoice.invoice_url, p_provider_transaction_id: invoice.id,
     });
-    if (attachError) return businessError(attachError.message) ?? json({ error: "ATTACH_FAILED" }, 500);
+    if (attachError) {
+      console.error("attach_payment RPC failed:", attachError.message);
+      return businessError(attachError.message) ?? json({ error: "ATTACH_FAILED" }, 500);
+    }
     return json({ booking_id: bookingId, order_id: orderId,
       redirect_url: invoice.invoice_url, hold_expires_at: alloc!.expires_at });
   } catch (e) {
