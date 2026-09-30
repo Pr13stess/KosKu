@@ -1,4 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { File } from "expo-file-system";
 import type { ChatRepository } from "../../domain/repositories/ChatRepository";
 import type { Conversation, Message, MessageType } from "../../domain/models";
 
@@ -151,14 +152,17 @@ export class SupabaseChatRepository implements ChatRepository {
     clientMessageId: string,
   ) {
     const senderId = await this.currentUserId();
-    const path = `${conversationId}/${clientMessageId}.jpg`;
-    const response = await fetch(localUri);
-    const blob = await response.blob();
-    if (blob.size > MAX_IMAGE_BYTES)
+    // fetch(uri).blob() is unreliable on React Native (silently truncates
+    // /corrupts binary data through its base64 shim). Read the local file
+    // directly and upload its raw bytes instead.
+    const file = new File(localUri);
+    if (file.size > MAX_IMAGE_BYTES)
       throw new Error("Ukuran gambar maksimal 5 MB.");
+    const bytes = await file.arrayBuffer();
+    const path = `${conversationId}/${clientMessageId}.jpg`;
     const { error: uploadError } = await this.client.storage
       .from(BUCKET)
-      .upload(path, blob, { contentType: "image/jpeg", upsert: false });
+      .upload(path, bytes, { contentType: "image/jpeg", upsert: false });
     if (uploadError) throw new Error(uploadError.message);
     const { data, error } = await this.client
       .from("messages")
