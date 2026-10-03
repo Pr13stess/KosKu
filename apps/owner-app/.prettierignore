@@ -1,0 +1,7 @@
+node_modules
+dist
+.expo
+supabase/base
+supabase/migrations
+package-lock.json
+deno.lock

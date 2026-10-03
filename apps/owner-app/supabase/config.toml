@@ -1,0 +1,10 @@
+project_id = "kosku-owner"
+
+[functions.agora-token]
+verify_jwt = false
+[functions.owner-upload]
+verify_jwt = false
+[functions.owner-maintenance]
+verify_jwt = false
+# Each user endpoint validates the bearer token with Auth.getUser.
+# Maintenance uses its own server-only secret.

@@ -1,0 +1,37 @@
+{
+  "expo": {
+    "name": "KosKu Owner",
+    "slug": "kosku-owner",
+    "version": "0.1.0",
+    "scheme": "kosku-owner",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "bundleIdentifier": "com.kosku.demo.owner",
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "Kamera untuk survei video dan foto kos.",
+        "NSMicrophoneUsageDescription": "Mikrofon untuk panggilan survei kos."
+      }
+    },
+    "android": {
+      "package": "com.kosku.demo.owner",
+      "permissions": [
+        "CAMERA",
+        "RECORD_AUDIO"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Pilih foto kos atau bukti verifikasi dummy.",
+          "cameraPermission": "Ambil foto kos atau bukti verifikasi dummy."
+        }
+      ],
+      "expo-notifications",
+      "expo-audio",
+      "expo-asset"
+    ]
+  }
+}
